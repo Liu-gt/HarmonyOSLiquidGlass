@@ -1,0 +1,46 @@
+# HarmonyOS / DevEco
+/node_modules
+/oh_modules
+**/oh_modules
+/local.properties
+/.idea
+**/.idea
+/.hvigor
+**/.hvigor
+**/build
+**/.cxx
+**/.preview
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+**/BuildProfile.ets
+/.appanalyzer
+
+# Native / third-party binaries
+*.so
+*.har
+*.a
+*.o
+
+# Signing material (never commit)
+*.p12
+*.cer
+*.p7b
+*.keystore
+*.jks
+*.pem
+*.key
+*.der
+*.csr
+signing/
+.signing/
+.ohos/
+**/.ohos/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.iml
+*.log
+.githooks/

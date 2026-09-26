@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "HarmonyOS Liquid Glass demo"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "HarmonyOS Liquid Glass demo"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Liquid Glass"
+    }
+  ]
+}

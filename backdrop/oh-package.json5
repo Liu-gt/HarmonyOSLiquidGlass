@@ -1,0 +1,11 @@
+{
+  "name": "backdrop",
+  "version": "1.0.0",
+  "description": "Liquid Glass (backdrop) material and glass components for HarmonyOS, rendered with XComponent + EGL/GLES.",
+  "main": "Index.ets",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "libbackdrop.so": "file:./src/main/cpp/types/libbackdrop"
+  }
+}

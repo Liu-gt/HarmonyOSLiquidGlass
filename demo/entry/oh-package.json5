@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "HarmonyOS Liquid Glass demo entry module.",
+  "main": "",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "backdrop": "file:../../backdrop"
+  }
+}

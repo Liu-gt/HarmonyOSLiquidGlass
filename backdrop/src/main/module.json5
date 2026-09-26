@@ -1,0 +1,10 @@
+{
+  "module": {
+    "name": "backdrop",
+    "type": "har",
+    "deviceTypes": [
+      "phone",
+      "tablet"
+    ]
+  }
+}

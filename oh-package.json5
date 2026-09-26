@@ -1,0 +1,8 @@
+{
+  "modelVersion": "6.0.0",
+  "description": "HarmonyOS Liquid Glass (backdrop) library project. The runnable demo lives in demo/.",
+  "dependencies": {
+  },
+  "devDependencies": {
+  }
+}
