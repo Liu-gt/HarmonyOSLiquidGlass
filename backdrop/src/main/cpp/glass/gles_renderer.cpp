@@ -57,26 +57,62 @@ float ditherNoise(vec2 px) {
 // 两个 shader 都从这里拼装，避免"两套实现"漂移 —— 与上游 SkSL 用
 // `$RoundedRectSDF` 模板变量拼字符串是同一个做法。
 constexpr char kGlslSdfHelpers[] = R"(
-float sdRoundedRect(vec2 coord, vec2 halfSize, float radius) {
-    vec2 cornerCoord = abs(coord) - (halfSize - vec2(radius));
-    float outside = length(max(cornerCoord, 0.0)) - radius;
+// G2 连续曲率圆角（精确回旋线 / Clothoid 二阶连续过渡，对齐 iOS .continuous 圆角曲线）：
+// 在 [-w, +w] 过渡肩区内，令距离平方项 g2CornerSq(x, w) 的二阶导数（即曲率 κ）
+// 从直边的 0 严格线性爬升至圆弧的 2（无任何曲率过冲或拐点）：
+//   x <= -w：g2CornerSq = 0 -> 直边处曲率恒为 0，100% 平直不鼓肚；
+//   -w < x < +w：g2CornerSq = (x + w)^3 / (6w) -> 一阶、二阶导数在 -w 与 +w 两端均严格连续（G2）；
+//   x >= +w（45° 圆角主弧区）：g2CornerSq = x^2 + w^2/3 -> 与标准圆弧严格同心，匹配内嵌胶囊按钮。
+float g2CornerSq(float x, float w) {
+    if (w <= 1e-4) {
+        float m = max(x, 0.0);
+        return m * m;
+    }
+    if (x <= -w) {
+        return 0.0;
+    }
+    if (x < w) {
+        float u = x + w;
+        return (u * u * u) / (6.0 * w);
+    }
+    return x * x + (w * w) / 3.0;
+}
+
+float sdRoundedRectG2(vec2 coord, vec2 halfSize, float radius, float g2Factor) {
+    float minHalf = min(halfSize.x, halfSize.y);
+    float r = clamp(radius, 0.0, minHalf);
+    vec2 cornerCoord = abs(coord) - (halfSize - vec2(r));
+    // 存在直边余量时（r < minHalf，如 Dialog 面板）启用 G2 连续曲率过渡半宽 w；
+    // 胶囊或正圆（r == minHalf）无直边余量，w = 0 自动保持标准半圆端头。
+    float w = clamp(min(r * clamp(g2Factor, 0.0, 0.65), (minHalf - r) * 0.85), 0.0, r * 0.65);
+    float d2 = g2CornerSq(cornerCoord.x, w) + g2CornerSq(cornerCoord.y, w);
+    float rEff = sqrt(r * r + (w * w) / 3.0);
+    float outside = sqrt(d2) - rEff;
     float inside = min(max(cornerCoord.x, cornerCoord.y), 0.0);
     return outside + inside;
+}
+
+float sdRoundedRect(vec2 coord, vec2 halfSize, float radius) {
+    return sdRoundedRectG2(coord, halfSize, radius, 0.45);
 }
 
 // 距离场梯度（= 表面外法线）。**用中央差分而不是上游的解析分支式**：
 // 解析式在形状中轴 / 内矩形处会 `normalize(vec2(0))` 突变，直接拿来做棱边高光
 // 会出现硬边楔形（之前是靠"边缘衰减遮罩"硬压掉的，那是权宜之计）。
 // 差分版本处处平滑，高光就能用上游的原始公式而不需要遮罩。
-vec2 gradSdRoundedRect(vec2 coord, vec2 halfSize, float radius) {
+vec2 gradSdRoundedRectG2(vec2 coord, vec2 halfSize, float radius, float g2Factor) {
     float e = 1.0;
-    float dx = sdRoundedRect(coord + vec2(e, 0.0), halfSize, radius)
-             - sdRoundedRect(coord - vec2(e, 0.0), halfSize, radius);
-    float dy = sdRoundedRect(coord + vec2(0.0, e), halfSize, radius)
-             - sdRoundedRect(coord - vec2(0.0, e), halfSize, radius);
+    float dx = sdRoundedRectG2(coord + vec2(e, 0.0), halfSize, radius, g2Factor)
+             - sdRoundedRectG2(coord - vec2(e, 0.0), halfSize, radius, g2Factor);
+    float dy = sdRoundedRectG2(coord + vec2(0.0, e), halfSize, radius, g2Factor)
+             - sdRoundedRectG2(coord - vec2(0.0, e), halfSize, radius, g2Factor);
     vec2 g = vec2(dx, dy);
     float len = length(g);
     return len > 1e-4 ? g / len : vec2(0.0);
+}
+
+vec2 gradSdRoundedRect(vec2 coord, vec2 halfSize, float radius) {
+    return gradSdRoundedRectG2(coord, halfSize, radius, 0.45);
 }
 
 // 透镜位移量曲线：0（折射带内缘）-> 1（形状最外缘）
@@ -279,6 +315,9 @@ uniform float uShowLabels;       // 0/1（页签场景改用 pass 5 的文字叠
 // 0 = 直接写屏（底板：形状外画清晰背景 + 投影，alpha 恒 1）
 // 1 = 叠加混合（浮动件：形状外只输出自己的投影，形状内输出覆盖率 alpha）
 uniform float uOverlayMode;
+uniform float uG2Factor;         // G2 圆角平滑度（0..0.65，默认 0.45）
+uniform float uRimClarity;       // 边缘清晰折射采样混入比例（0..1，默认 0.38）
+uniform float uBevelAlphaScale;  // 边缘折射棱面处底色保留比例（0..1，默认 0.68）
 out vec4 outColor;
 
 vec3 saturate3(vec3 c, float amount) {
@@ -303,7 +342,7 @@ void main() {
     vec3 blurred = texture(uBlurred, sampleUv).rgb;
 
     float radius = radiusAt(centeredCoord, uRadii);
-    float sd = sdRoundedRect(centeredCoord, halfSize, radius);
+    float sd = sdRoundedRectG2(centeredCoord, halfSize, radius, uG2Factor);
 
     // ---- 形状外：清晰背景 + 外投影 ----
     // 对齐上游 Shadow 默认值：radius 24dp（模糊半径）、offset.y = radius/6、颜色黑 alpha 0.1。
@@ -311,7 +350,7 @@ void main() {
     // ⚠️ 衰减必须从**形状边缘向外**算：sdShadow=0 处最强、到 blur 距离衰减到 0。
     //    之前写的 smoothstep(-96, 0, sdShadow) 在形状外恒为 1 →
     //    等于把整屏形状外**均匀压暗 10%**，根本没有随距离衰减。
-    float sdShadow = sdRoundedRect(centeredCoord + vec2(0.0, uShadowOffset), halfSize, radius);
+    float sdShadow = sdRoundedRectG2(centeredCoord + vec2(0.0, uShadowOffset), halfSize, radius, uG2Factor);
     float shade = 1.0 - smoothstep(0.0, max(uShadowBlur, 1.0), sdShadow);
     vec3 outsideCol = sharp * (1.0 - shade * uShadowAlpha * uShadow);
 
@@ -327,12 +366,10 @@ void main() {
     } else {
         // ===== 折射 / 色散（与 SkSL 版同结构）=====
         float d = circleMap(1.0 - edge / uRefractionHeight) * uRefractionAmount;
-        float gradRadius = min(radius * 1.5, min(halfSize.x, halfSize.y));
-        // 退化保护：形状中轴 / 内矩形里的 SDF 差分是**零向量**，而 gradSdRoundedRect
-        // 对零向量返回 (0,0) —— 外面再套一层 normalize 就是 normalize(vec2(0)) = NaN。
-        // 折射高度调到 > 半高时（id 2 最大 48dp > 底板半高 30dp）中轴会落进折射带，
-        // 于是底板正中会出现一个 NaN 像素（黑块/彩点）。这里对长度再检一次。
-        vec2 g = gradSdRoundedRect(centeredCoord, halfSize, gradRadius);
+        // sdRoundedRectG2 已具备 G2 曲率连续性，法线差分直接使用真实圆角半径 radius，
+        // 避免旧版 radius * 1.5 虚扩导致大圆角面板在直边中段产生法线内凹畸变。
+        float gradRadius = min(radius, min(halfSize.x, halfSize.y));
+        vec2 g = gradSdRoundedRectG2(centeredCoord, halfSize, gradRadius, uG2Factor);
         // depthEffect（上游 Shaders.kt:80）：在法线方向上再叠一层**径向**分量，
         // 做出"有厚度"的凸起折射。radial 在中轴处也要防零向量。
         if (uDepthEffect > 0.001) {
@@ -344,10 +381,16 @@ void main() {
         vec2 refractedCoord = samplePx + d * grad;
         vec2 uv = refractedCoord / uResolution;
 
+        // 边缘光学折射清晰度：在靠近外缘的曲面棱边处（bevelFrac -> 1）适度混入清晰背景折射采样，
+        // 使穿过弹窗边缘的背景线条产生真实的光学弯折感，同时不过度锐化。
+        float bevelFrac = clamp(1.0 - edge / max(uRefractionHeight, 1e-4), 0.0, 1.0);
+        float rimClarity = (uBlurRadius > 1.0) ? (smoothstep(0.25, 0.95, bevelFrac) * uRimClarity) : 0.0;
+
         // 透镜采样模糊后背景（上游管线 blur() -> lens()，透镜计算以模糊图像作为输入源），
-        // 确保底板主体与折射边缘均具备一致的模糊与色散质感。
+        // 确保底板主体与折射边缘均具备一致的柔化与色散质感。
         if (uDispersion <= 0.0) {
-            result = saturate3(texture(uBlurred, uv).rgb, uVibrancy);
+            vec3 refCol = mix(texture(uBlurred, uv).rgb, texture(uBackdrop, uv).rgb, rimClarity);
+            result = saturate3(refCol, uVibrancy);
         } else {
             float dispersionIntensity =
                 ((centeredCoord.x * centeredCoord.y) / (halfSize.x * halfSize.y));
@@ -369,6 +412,14 @@ void main() {
             col.b += c.b / 3.0;
             c = texture(uBlurred, uv - dispersedCoord);
             col.r += c.r / 7.0; col.b += c.b / 3.0;
+            if (rimClarity > 0.001) {
+                vec3 colSharp = vec3(
+                    texture(uBackdrop, uv + dispersedCoord * 0.5).r,
+                    texture(uBackdrop, uv).g,
+                    texture(uBackdrop, uv - dispersedCoord * 0.5).b
+                );
+                col = mix(col, colSharp, rimClarity);
+            }
             result = saturate3(col, uVibrancy);
         }
     }
@@ -377,8 +428,14 @@ void main() {
     // 放在表面填充之前：效果链上它作用在"采样到的背景"上。
     result = colorControls(result, uBrightness, uContrast, uSaturation);
 
-    // ---- 表面填充（浅色偏透）：containerAlpha；tinted 按钮用 uSurfaceColor 换色 ----
-    result = mix(result, uSurfaceColor, uSurfaceAlpha);
+    // ---- 表面填充（浅色/深色偏透）：containerAlpha；tinted 按钮用 uSurfaceColor 换色 ----
+    // 半透明玻璃面板在四周折射棱面处适度减薄底色，避免出现生硬暗圈的同时让边缘折射自然透出。
+    float effSurfaceAlpha = uSurfaceAlpha;
+    if (uRefractionHeight > 0.5 && uSurfaceAlpha < 0.85 && edge < uRefractionHeight) {
+        float bevelT = clamp(edge / max(uRefractionHeight, 1e-4), 0.0, 1.0);
+        effSurfaceAlpha *= mix(uBevelAlphaScale, 1.0, smoothstep(0.0, 0.75, bevelT));
+    }
+    result = mix(result, uSurfaceColor, effSurfaceAlpha);
 
     // ---- 内阴影（顶部按钮用；底座 / 浮动件把 uInnerAlpha 传 0，等价于关）----
     // 上游 InnerShadow(radius = 按钮参数 18 × press, alpha = press)，颜色黑 alpha 0.15。
@@ -397,8 +454,8 @@ void main() {
         // 不做描边环。默认 alpha 仍走 uHighlight。
         result += vec3(uHighlight);
     } else {
-        float gradRadius = min(radius * 1.5, min(halfSize.x, halfSize.y));
-        vec2 nrm = gradSdRoundedRect(centeredCoord, halfSize, gradRadius);
+        float gradRadius = min(radius, min(halfSize.x, halfSize.y));
+        vec2 nrm = gradSdRoundedRectG2(centeredCoord, halfSize, gradRadius, uG2Factor);
         dl = dot(nrm, vec2(0.70710678, 0.70710678));
         float ring = 1.0 - smoothstep(uHighlightWidth, uHighlightWidth + uHighlightBlur, edge);
         result += vec3(abs(dl) * uHighlight * ring);
@@ -463,20 +520,21 @@ uniform float uSurfaceWhite;  // 表面白填充（id 36 静止 / 46 拖动，�
 uniform float uHighlight;
 uniform float uHighlightWidth;
 uniform float uHighlightBlur;
+// 外缘细灰线（HallPass）：按压时在最外缘描一条极淡的浅灰线增加轮廓对比度（0 = 关）
+uniform float uEdgeLine;
 uniform float uShadowBlur;
 uniform float uShadowOffset;
 uniform float uShadowAlpha;
+// 外投影纵向渐变：0 = 均匀一圈；1 = 只落在轮廓下方（中线以上不投影、往下越散、两侧收窄 35%）
+uniform float uShadowSpreadV;
 uniform float uScaleX;
 uniform float uInnerRadius;   // 内阴影半径（px）＝ InnerShadow.radius
 uniform float uInnerAlpha;    // 内阴影强度（已含颜色黑 alpha 0.15）
 uniform float uSceneBlur;     // 指示器模糊半径（px）；0 = 关
 uniform float uScaleY;
-uniform float uInflate;       // 按压：每边向外膨胀的像素（等边距，不是绕中心等比缩放）
-// 按压时**玻璃内部内容**的采样变换（与 progGlass_ 的同名 uniform 同式）：
-//   samplePx = uSamplePivot + (px - uSamplePivot) / uSampleScale
-// scale < 1 = 透镜缩微（形状扩张的同时内容往中心收）。
-uniform vec2 uSampleScale;
-uniform vec2 uSamplePivot;
+uniform float uShapeScaleX;   // 按压形状缩放（横向，id 82）
+uniform float uShapeScaleY;   // 按压形状缩放（纵向，id 51）：只撑胶囊形状，不放大内容
+uniform float uPressScale;    // 按压采样缩放：<1 = 透镜缩微（形状向外膨胀、内部内容往中心收）
 // 页签文字/图标的两张位图（逐像素同布局，只有颜色不同）：
 //   uLabels       = 常态色 —— 形状外按**屏幕位置**叠加，所以拖指示器时它们纹丝不动
 //   uLabelsAccent = 凸显色 —— 形状内按**折射位置**叠加，于是"透过指示器看到的"才变色，
@@ -538,35 +596,47 @@ vec3 sampleSceneBlurredUV(vec2 uv) {
 
 void main() {
     vec2 px = vUv * uResolution;
-    // 采样变换只作用于形状**内部**：形状外仍是 1:1 的清晰场景（这趟是全屏三角形，
-    // 形状外跟着缩放会把整屏都带歪）。pivot 取胶囊中心，scale = 1 时与原式逐像素等价。
-    vec2 samplePx = uSamplePivot + (px - uSamplePivot) / uSampleScale;
-    vec2 sampleUv = samplePx / uResolution;
     vec2 restHalf = uRect.zw * 0.5;
     vec2 center = uRect.xy + restHalf;
-    // 按压 = **等边距膨胀**：每边向外多 uInflate 像素。不用绕中心等比缩放——
-    // 胶囊宽(≈85dp) ≫ 高(42dp)，等比 1.5× 时横向每边多 21dp、竖向只多 10.5dp，
-    // 四周永远不会等距。半径同步 +uInflate 后仍是胶囊（圆弧上是精确等距外扩）。
-    vec2 halfSize = restHalf + uInflate;
-    // 拖动速度的拉长/压扁仍走非等比缩放，与按压膨胀解耦。
+    // 按压 = **形状缩放**（uShapeScaleX/Y，只撑胶囊）+ **内容缩放**（uPressScale，透镜采样）。
+    // 横纵分开缩放：纵向鼓得多、横向收着长（椭圆角随纵向半径走，仍是胶囊）。
+    vec2 halfSize = restHalf * vec2(uShapeScaleX, uShapeScaleY);
+    // 拖动速度的拉长/压扁仍走非等比缩放，与按压缩放解耦。
     vec2 centeredCoord = (px - center) / vec2(uScaleX, uScaleY);
-    // 四角半径：胶囊四值相等；半径同步 +uInflate 后仍是精确等距外扩。
-    float radius = radiusAt(centeredCoord, uRadii) + uInflate;
+    // 圆角半径跟纵向缩放（半径 = 半高，纵向一撑就还是胶囊端头）。
+    float radius = radiusAt(centeredCoord, uRadii) * uShapeScaleY;
     float sd = sdRoundedRect(centeredCoord, halfSize, radius);
 
     // 指示器投影：鼓出底座时靠它和底座边框"断开"，做出 iOS 那种空隙/分离感。
+    // 外投影纵向渐变：按压时中线以上不投影、往下越散、两侧收窄到 35%，影子只落在轮廓下方。
     float sdShadow = sdRoundedRect(centeredCoord + vec2(0.0, uShadowOffset),
                                    halfSize, radius);
-    float shade = 1.0 - smoothstep(0.0, max(uShadowBlur, 1.0), sdShadow);
+    float shadowBlurV = uShadowBlur;
+    float shadowAlphaV = uShadowAlpha;
+    if (uShadowSpreadV > 0.001) {
+        float tV = (halfSize.y - centeredCoord.y) / max(2.0 * halfSize.y, 1e-4);
+        float bottomT = clamp((tV - 0.5) / 0.5, 0.0, 1.0);
+        vec2 gS = gradSdRoundedRect(centeredCoord + vec2(0.0, uShadowOffset), halfSize, radius);
+        float sideW = mix(0.35, 1.0, clamp(-gS.y / max(length(gS), 1e-4), 0.0, 1.0));
+        float grow = mix(1.0, bottomT * sideW, uShadowSpreadV);
+        shadowBlurV = uShadowBlur * grow;
+        shadowAlphaV = uShadowAlpha * grow;
+    }
+    float shade = 1.0 - smoothstep(0.0, max(shadowBlurV, 1.0), sdShadow);
     // 形状外：清晰场景 + 常态色页签。页签按屏幕坐标采（不含透镜位移）——
     // 指示器滑到哪儿都不会带动它们；指示器自己的投影仍压在这一层之上。
     vec3 outsideScene = sampleScene(px).rgb;
     if (uShowTabLabels > 0.5) {
         outsideScene = overLabels(outsideScene, texture(uLabels, labelUv(labelLocalAt(px))));
     }
-    vec3 outsideCol = outsideScene * (1.0 - shade * uShadowAlpha);
+    vec3 outsideCol = outsideScene * (1.0 - shade * shadowAlphaV);
 
     float edge = max(0.0, -sd);
+    // 透镜采样点：绕中心按 uPressScale 缩放后取场景（<1 = 内容缩微）。
+    // 折射位移除以 uPressScale —— 采样点偏移 δ 在缩放后的画面上呈现为 δ×scale，
+    // 除回去让边缘折射的视觉强度不随按压倍率变化。
+    vec2 lensCoord = center + (px - center) / uPressScale;
+    vec2 sampleUv = lensCoord / uResolution;
     vec3 result;
     // 凸显色页签的采样位置：**只跟透镜位移，不跟"按压采样缩小"**。
     // 缩小是绕胶囊中心的整体变换，带上它文字就会绕中心缩放 —— 胶囊一动，
@@ -585,7 +655,7 @@ void main() {
         }
         float gradLen = length(g);
         vec2 grad = gradLen > 1e-4 ? g / gradLen : vec2(0.0);
-        vec2 refractedCoord = samplePx + d * grad;
+        vec2 refractedCoord = lensCoord + (d * grad) / uPressScale;
         vec2 uv = refractedCoord / uResolution;
         labelPx = px + d * grad;
 
@@ -593,7 +663,7 @@ void main() {
             result = sampleSceneBlurredUV(uv);
         } else {
             float intensity = (centeredCoord.x * centeredCoord.y) / (halfSize.x * halfSize.y);
-            vec2 dispersed = (d * grad * intensity) / uResolution;
+            vec2 dispersed = (d * grad * intensity * 2.5) / uResolution;
             // 色散走单点采样（7 次 × 9-tap 模糊太贵）；模糊默认 0，实践中不冲突
             vec3 col = vec3(0.0);
             vec4 c;
@@ -652,6 +722,15 @@ void main() {
         float dl = dot(nrm, vec2(0.70710678, 0.70710678));
         float ring = 1.0 - smoothstep(uHighlightWidth, uHighlightWidth + uHighlightBlur, edge);
         result += vec3(abs(dl) * uHighlight * ring);
+    }
+
+    // ---- 外缘细灰线（HallPass）----
+    // 纯色（尤其白底）上玻璃轮廓容易"化开"，在**最外缘 ~1.5px** 描一条极淡的浅灰线
+    // 增加对比度（叠在棱边高光之外，形成"灰线 + 白高光"的薄棱边）。
+    // uEdgeLine = 0 时完全关闭（静止态为 0）。
+    if (uEdgeLine > 0.001) {
+        float line = 1.0 - smoothstep(0.0, 1.5, edge);
+        result = mix(result, vec3(0.72, 0.73, 0.75), line * uEdgeLine);
     }
 
     // ---- 抗锯齿（同底板）----
@@ -1009,7 +1088,7 @@ const std::vector<std::string> kTabIconPaths = {
 // 页签内容颜色（对齐参考实现的 TabContentSelected / TabContentUnselected）
 constexpr uint32_t kTabSelectedRgb = 0x00007DFF;    // #007DFF
 constexpr uint32_t kTabUnselectedRgb = 0x00000000;  // 黑
-constexpr float kTabIconSizeDp = 20.0f;             // TabIconSize
+constexpr float kTabIconSizeDp = 25.6f;             // TabIconSize (对齐 HallPass TAB_ICON_SIZE 25.6)
 constexpr float kTabIconGapDp = 2.0f;               // TabIconLabelGap
 constexpr float kTabIconBoldStroke = 0.8f;          // TabIconBoldStroke（24 视口单位）
 
@@ -1116,6 +1195,16 @@ void GlesRenderer::SetPaused(bool paused) {
     forceRedraw_.store(true);
 }
 
+void GlesRenderer::SetDarkMode(bool dark) {
+    const bool prev = darkMode_.exchange(dark);
+    if (prev != dark) {
+        overlayTextDirty_.store(true);
+        dialogBtnLabelDirty_.store(true);
+        forceRedraw_.store(true);
+        GLOG("dark mode changed: %{public}d -> %{public}d", prev ? 1 : 0, dark ? 1 : 0);
+    }
+}
+
 void GlesRenderer::PaceFrame() {
     const int64_t now = NowMs();
     const bool interacting = (now - lastTouchMs_.load()) < kInteractiveWindowMs;
@@ -1171,6 +1260,8 @@ void GlesRenderer::ResetCatalogState(int scene) {
     dialogPress_[0] = dialogPress_[1] = 0.0f;
     dialogPressVel_[0] = dialogPressVel_[1] = 0.0f;
     dialogDown_ = -1;
+    dialogScale_ = 0.92f;
+    dialogScaleVel_ = 0.0f;
 
     ccProgress_ = 1.0f;
     ccProgressVel_ = 0.0f;
@@ -1212,6 +1303,8 @@ void GlesRenderer::ResetCatalogState(int scene) {
 
     contentTextDirty_.store(true);
     overlayTextDirty_.store(true);
+    buttonLabelsDirty_.store(true);
+    dialogBtnLabelDirty_.store(true);
     GLOG("catalog state reset for scene %{public}d", scene);
 }
 
@@ -1374,13 +1467,14 @@ void GlesRenderer::UpdateAnim(float dt) {
 
     // ---- scaleX / scaleY：按压缩放的**独立弹簧**（参数 60..63）----
     // 对齐参考实现的 DampedDragAnimation：press() 里把两个 scale 弹到 pressedScale，
-    // release() 里弹回 1（初始缩放）。之前 GL 侧是"press 进度 × 目标值"直接换算，
-    // 少了这层弹簧 —— 观感上按下去/弹回来都会"硬"一档。
+    // release() 里弹回 1（初始缩放）。横向/纵向目标分开：
+    // 横向 targetX = kPressedScaleX (82)，纵向 targetY = kPressedScale (51)。
     {
-        const float target = anim_.dragging ? params_.N(pid::kPressedScale) : 1.0f;
-        SpringStep(anim_.scaleX, anim_.scaleXVelocity, target, params_.N(pid::kScaleXStiffness),
+        const float targetX = anim_.dragging ? params_.N(pid::kPressedScaleX) : 1.0f;
+        const float targetY = anim_.dragging ? params_.N(pid::kPressedScale) : 1.0f;
+        SpringStep(anim_.scaleX, anim_.scaleXVelocity, targetX, params_.N(pid::kScaleXStiffness),
                    params_.N(pid::kScaleXDamping), dt);
-        SpringStep(anim_.scaleY, anim_.scaleYVelocity, target, params_.N(pid::kScaleYStiffness),
+        SpringStep(anim_.scaleY, anim_.scaleYVelocity, targetY, params_.N(pid::kScaleYStiffness),
                    params_.N(pid::kScaleYDamping), dt);
         // 防御：极端参数（pressedScale 1.8）下也不让缩放变成 0 或负
         anim_.scaleX = std::max(0.1f, anim_.scaleX);
@@ -1496,24 +1590,20 @@ RectF SliderKnobRect(int screenW, int screenH, float d, float progress) {
 }
 
 RectF DialogPanelRect(int screenW, int screenH, float d) {
-    const float titleBlock = 24.0f * d * 1.35f;
-    const float bodyBlock = 5.0f * 15.0f * d * 1.35f;
     RectF r;
-    r.x = 40.0f * d;
-    r.w = static_cast<float>(screenW) - 80.0f * d;
-    r.h = 24.0f * d + titleBlock + 12.0f * d + bodyBlock + 12.0f * d + 48.0f * d + 24.0f * d;
+    r.x = 20.0f * d;
+    r.w = static_cast<float>(screenW) - 40.0f * d;
+    // 顶部内边距 26dp + 标题2行 (~44dp) + 间距 10dp + 正文2行 (~37dp) + 间距 24dp + 按钮 50dp + 底部内边距 18dp = 209dp
+    r.h = 26.0f * d + 44.0f * d + 10.0f * d + 37.0f * d + 24.0f * d + 50.0f * d + 18.0f * d;
     r.y = (static_cast<float>(screenH) - r.h) * 0.5f;
     return r;
 }
 
-void DialogButtonRects(int screenW, int screenH, float d, RectF out[2]) {
+void DialogButtonRects(int screenW, int screenH, float d, RectF *out) {
     const RectF p = DialogPanelRect(screenW, screenH, d);
-    const float pad = 24.0f * d;
-    const float gap = 16.0f * d;
-    const float btnH = 48.0f * d;
-    const float btnW = (p.w - pad * 2.0f - gap) * 0.5f;
-    out[0] = RectF{p.x + pad, p.y + pad, btnW, btnH};
-    out[1] = RectF{p.x + pad + btnW + gap, p.y + pad, btnW, btnH};
+    const float pad = 18.0f * d;
+    const float btnH = 50.0f * d;
+    out[0] = RectF{p.x + pad, p.y + 18.0f * d, p.w - pad * 2.0f, btnH};
 }
 
 RectF LockPanelRect(int screenW, int screenH, float d) {
@@ -1661,12 +1751,15 @@ void GlesRenderer::UpdateCatalogAnim(float dt) {
     std::lock_guard<std::mutex> lock(animMutex_);
     switch (scene) {
         case static_cast<int>(Scene::kButtons): {
-            // InteractiveHighlight 的按压弹簧：spring(0.5, 300)
+            // 按钮按压与回弹：刚度 340 + 阻尼 0.46，过冲约 20%，Q 弹有力且收敛迅速
             for (int i = 0; i < 4; i++) {
-                SpringStep(scenePress_[i], scenePressVel_[i], (sceneDown_ == i) ? 1.0f : 0.0f,
-                           300.0f, 0.5f, dt);
-                if (scenePress_[i] < 0.0f) { scenePress_[i] = 0.0f; scenePressVel_[i] = 0.0f; }
-                if (scenePress_[i] > 1.0f) { scenePress_[i] = 1.0f; scenePressVel_[i] = 0.0f; }
+                const float target = (sceneDown_ == i) ? 1.0f : 0.0f;
+                SpringStep(scenePress_[i], scenePressVel_[i], target, 340.0f, 0.46f, dt);
+                if (std::fabs(scenePress_[i] - target) < 0.001f && std::fabs(scenePressVel_[i]) < 0.005f) {
+                    scenePress_[i] = target;
+                    scenePressVel_[i] = 0.0f;
+                }
+                scenePress_[i] = std::max(-0.35f, std::min(1.45f, scenePress_[i]));
             }
             break;
         }
@@ -1716,11 +1809,19 @@ void GlesRenderer::UpdateCatalogAnim(float dt) {
             break;
         }
         case static_cast<int>(Scene::kDialog): {
+            SpringStep(dialogScale_, dialogScaleVel_, 1.0f, 260.0f, 0.65f, dt);
+            if (std::fabs(dialogScale_ - 1.0f) < 0.001f && std::fabs(dialogScaleVel_) < 0.005f) {
+                dialogScale_ = 1.0f;
+                dialogScaleVel_ = 0.0f;
+            }
             for (int i = 0; i < 2; i++) {
-                SpringStep(dialogPress_[i], dialogPressVel_[i], (dialogDown_ == i) ? 1.0f : 0.0f,
-                           300.0f, 0.5f, dt);
-                if (dialogPress_[i] < 0.0f) { dialogPress_[i] = 0.0f; dialogPressVel_[i] = 0.0f; }
-                if (dialogPress_[i] > 1.0f) { dialogPress_[i] = 1.0f; dialogPressVel_[i] = 0.0f; }
+                const float target = (dialogDown_ == i) ? 1.0f : 0.0f;
+                SpringStep(dialogPress_[i], dialogPressVel_[i], target, 340.0f, 0.46f, dt);
+                if (std::fabs(dialogPress_[i] - target) < 0.001f && std::fabs(dialogPressVel_[i]) < 0.005f) {
+                    dialogPress_[i] = target;
+                    dialogPressVel_[i] = 0.0f;
+                }
+                dialogPress_[i] = std::max(-0.35f, std::min(1.45f, dialogPress_[i]));
             }
             break;
         }
@@ -1895,22 +1996,23 @@ bool GlesRenderer::OnTouchCatalog(int action, float x, float y, int surfaceW, in
         }
         case static_cast<int>(Scene::kDialog): {
             std::lock_guard<std::mutex> lock(animMutex_);
-            RectF buttons[2];
-            DialogButtonRects(surfaceW, surfaceH, d, buttons);
-            int hit = -1;
-            for (int i = 0; i < 2; i++) {
-                if (RectHit(buttons[i], x, glY)) {
-                    hit = i;
-                    break;
-                }
-            }
+            RectF btn;
+            DialogButtonRects(surfaceW, surfaceH, d, &btn);
+            const bool hit = RectHit(btn, x, glY);
             if (action == 0) {
-                dialogDown_ = hit;
+                dialogDown_ = hit ? 0 : -1;
+                if (!hit) {
+                    const RectF p = DialogPanelRect(surfaceW, surfaceH, d);
+                    if (RectHit(p, x, glY)) {
+                        dialogScaleVel_ = -0.03f;
+                    }
+                }
             } else if (action == 1 || action == 3) {
-                const bool tapped = (action == 1) && (dialogDown_ >= 0) && (dialogDown_ == hit);
+                const bool tapped = (action == 1) && (dialogDown_ == 0) && hit;
                 dialogDown_ = -1;
                 if (tapped) {
-                    GLOG("dialog button %{public}d tapped", hit);
+                    dialogScaleVel_ = 0.06f;
+                    GLOG("dialog OK button tapped");
                 }
             }
             return true;
@@ -2343,6 +2445,8 @@ bool GlesRenderer::InitGl() {
     glGenTextures(1, &contentTextTex_);
     glGenTextures(1, &overlayTextTex_);
     glGenTextures(1, &planeIconTex_);
+    glGenTextures(4, buttonLabelTex_);
+    glGenTextures(1, &dialogBtnLabelTex_);
     // 飞机图标（控制中心 / 游乐场）：24×24 视口的绝对 path，白色、预乘 alpha
     {
         const int iconPx = std::max(8, static_cast<int>(kPlaneIconDp * params_.Density() + 0.5f));
@@ -2475,6 +2579,20 @@ void GlesRenderer::DestroyGl() {
     if (contentTextTex_ != 0) { glDeleteTextures(1, &contentTextTex_); contentTextTex_ = 0; }
     if (overlayTextTex_ != 0) { glDeleteTextures(1, &overlayTextTex_); overlayTextTex_ = 0; }
     if (planeIconTex_ != 0) { glDeleteTextures(1, &planeIconTex_); planeIconTex_ = 0; }
+    for (int i = 0; i < 4; i++) {
+        if (buttonLabelTex_[i] != 0) {
+            glDeleteTextures(1, &buttonLabelTex_[i]);
+            buttonLabelTex_[i] = 0;
+        }
+        buttonLabelW_[i] = 0;
+        buttonLabelH_[i] = 0;
+    }
+    if (dialogBtnLabelTex_ != 0) {
+        glDeleteTextures(1, &dialogBtnLabelTex_);
+        dialogBtnLabelTex_ = 0;
+    }
+    dialogBtnLabelW_ = 0;
+    dialogBtnLabelH_ = 0;
     planeIconSizePx_ = 0;
     contentTextW_ = 0;
     contentTextH_ = 0;
@@ -2518,7 +2636,9 @@ bool GlesRenderer::UploadLabels(int w, int h) {
     };
     const uint32_t selArgb = alphaByte(params_.N(pid::kLabelSelectedAlpha)) | kTabSelectedRgb;
     const uint32_t unselArgb = alphaByte(params_.N(pid::kLabelUnselectedAlpha)) | kTabUnselectedRgb;
-    const float iconSizePx = kTabIconSizeDp * params_.Density();
+    const float iconSizePx = (params_.N(pid::kTabIconSize) > 1.0f)
+                                 ? params_.Px(pid::kTabIconSize)
+                                 : (kTabIconSizeDp * params_.Density());
     const float iconGapPx = kTabIconGapDp * params_.Density();
     const float fontPx = params_.Px(pid::kLabelFontSize);
     const float innerPad = TabInnerPadPx();
@@ -2650,6 +2770,8 @@ bool GlesRenderer::EnsureTargets(int w, int h) {
     // 目录场景的文字位图与屏幕尺寸相关，尺寸变了要重传
     contentTextDirty_.store(true);
     overlayTextDirty_.store(true);
+    buttonLabelsDirty_.store(true);
+    dialogBtnLabelDirty_.store(true);
 
     GLOG("targets resized: %{public}d x %{public}d", w, h);
     return true;
@@ -2979,6 +3101,9 @@ void GlesRenderer::DrawGlass(const GlassSpec &s, GLuint targetFbo, int w, int h)
     glUniform1f(glGetUniformLocation(progGlass_, "uInnerAlpha"), s.innerAlpha);
     glUniform2f(glGetUniformLocation(progGlass_, "uSampleScale"), s.sampleScaleX, s.sampleScaleY);
     glUniform2f(glGetUniformLocation(progGlass_, "uSamplePivot"), s.samplePivotX, s.samplePivotY);
+    glUniform1f(glGetUniformLocation(progGlass_, "uG2Factor"), s.g2Factor);
+    glUniform1f(glGetUniformLocation(progGlass_, "uRimClarity"), s.rimClarity);
+    glUniform1f(glGetUniformLocation(progGlass_, "uBevelAlphaScale"), s.bevelAlphaScale);
     glUniform1f(glGetUniformLocation(progGlass_, "uShowLabels"), 0.0f);
     glUniform1f(glGetUniformLocation(progGlass_, "uOverlayMode"), 1.0f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -3029,6 +3154,59 @@ bool GlesRenderer::UploadOverlayText(int w, int h) {
                  GL_UNSIGNED_BYTE, bitmap.pixels.data());
     SetupTexture(overlayTextTex_);
     GLOG("overlay text texture %{public}dx%{public}d uploaded", bitmap.width, bitmap.height);
+    return true;
+}
+
+bool GlesRenderer::UploadButtonLabels(int screenW, int screenH) {
+    if (screenW <= 0 || screenH <= 0) {
+        return false;
+    }
+    const float d = params_.Density();
+    for (int i = 0; i < 4; i++) {
+        const RectF r = ButtonRectAt(screenW, screenH, d, i);
+        const int bw = std::max(1, static_cast<int>(std::ceil(r.w)));
+        const int bh = std::max(1, static_cast<int>(std::ceil(r.h)));
+        buttonLabelW_[i] = bw;
+        buttonLabelH_[i] = bh;
+
+        LabelBitmap bitmap;
+        if (RenderCenteredText(bw, bh, kButtonLabels[i], 15.0f * d, 0xFFFFFFFF, false, bitmap)) {
+            if (buttonLabelTex_[i] == 0) {
+                glGenTextures(1, &buttonLabelTex_[i]);
+            }
+            glBindTexture(GL_TEXTURE_2D, buttonLabelTex_[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, bitmap.width, bitmap.height, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, bitmap.pixels.data());
+            SetupTexture(buttonLabelTex_[i]);
+        }
+    }
+    GLOG("button labels uploaded (w=%{public}d, h=%{public}d, density=%.2f)", screenW, screenH, d);
+    return true;
+}
+
+bool GlesRenderer::UploadDialogBtnLabel(int screenW, int screenH) {
+    if (screenW <= 0 || screenH <= 0) {
+        return false;
+    }
+    const float d = params_.Density();
+    RectF btn;
+    DialogButtonRects(screenW, screenH, d, &btn);
+    const int bw = std::max(1, static_cast<int>(std::ceil(btn.w)));
+    const int bh = std::max(1, static_cast<int>(std::ceil(btn.h)));
+    dialogBtnLabelW_ = bw;
+    dialogBtnLabelH_ = bh;
+
+    const uint32_t btnTextArgb = darkMode_.load() ? 0xFFFFFFFF : 0xFF0B0B0F;
+    LabelBitmap bitmap;
+    if (RenderCenteredText(bw, bh, "OK", 17.5f * d, btnTextArgb, true, bitmap)) {
+        if (dialogBtnLabelTex_ == 0) {
+            glGenTextures(1, &dialogBtnLabelTex_);
+        }
+        glBindTexture(GL_TEXTURE_2D, dialogBtnLabelTex_);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, bitmap.width, bitmap.height, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, bitmap.pixels.data());
+        SetupTexture(dialogBtnLabelTex_);
+    }
     return true;
 }
 
@@ -3085,58 +3263,48 @@ bool GlesRenderer::BuildOverlayText(int scene, int w, int h, std::vector<TextRun
     const float sh = static_cast<float>(h);
 
     switch (scene) {
-        case static_cast<int>(Scene::kButtons): {
-            for (int i = 0; i < 4; i++) {
-                const RectF r = ButtonRectAt(w, h, d, i);
-                TextRun run;
-                run.text = kButtonLabels[i];
-                run.x = r.x + r.w * 0.5f;
-                run.y = sh - (r.y + r.h) + (r.h - 15.0f * d * 1.35f) * 0.5f;
-                run.fontSizePx = 15.0f * d;
-                run.argb = 0xFFFFFFFF;
-                run.align = 1;
-                runs.push_back(run);
-            }
-            return true;
-        }
         case static_cast<int>(Scene::kDialog): {
             const RectF p = DialogPanelRect(w, h, d);
             const float panelTop = sh - (p.y + p.h);
-            const float titleBlock = 24.0f * d * 1.35f;
-            TextRun title;
-            title.text = "Dialog Title";
-            title.x = p.x + 28.0f * d;
-            title.y = panelTop + 24.0f * d;
-            title.fontSizePx = 24.0f * d;
-            title.argb = 0xFFFFFFFF;
-            title.align = 0;
-            runs.push_back(title);
+            const bool isDark = darkMode_.load();
+            const uint32_t titleArgb = isDark ? 0xFFFFFFFF : 0xFF0B0B0F;
+            const uint32_t bodyArgb = isDark ? 0xB8EBEBF5 : 0xD9282830;
 
-            TextRun body;
-            body.text = kLoremIpsum;
-            body.x = p.x + 24.0f * d;
-            body.y = panelTop + 24.0f * d + titleBlock + 12.0f * d;
-            body.wrapWidth = p.w - 48.0f * d;
-            body.fontSizePx = 15.0f * d;
-            body.argb = 0xADFFFFFF;   // 白 alpha 0.68
-            body.align = 0;
-            body.maxLines = 5;
-            runs.push_back(body);
+            TextRun t1;
+            t1.text = "Deleted notes are moved to the";
+            t1.x = p.x + 24.0f * d;
+            t1.y = panelTop + 26.0f * d;
+            t1.fontSizePx = 18.0f * d;
+            t1.argb = titleArgb;
+            t1.bold = true;
+            runs.push_back(t1);
 
-            RectF buttons[2];
-            DialogButtonRects(w, h, d, buttons);
-            const char *labels[2] = {"Cancel", "Okay"};
-            for (int i = 0; i < 2; i++) {
-                TextRun label;
-                label.text = labels[i];
-                label.x = buttons[i].x + buttons[i].w * 0.5f;
-                label.y = sh - (buttons[i].y + buttons[i].h) +
-                          (buttons[i].h - 16.0f * d * 1.35f) * 0.5f;
-                label.fontSizePx = 16.0f * d;
-                label.argb = 0xFFFFFFFF;
-                label.align = 1;
-                runs.push_back(label);
-            }
+            TextRun t2;
+            t2.text = "Recently Deleted folder.";
+            t2.x = p.x + 24.0f * d;
+            t2.y = t1.y + 22.0f * d;
+            t2.fontSizePx = 18.0f * d;
+            t2.argb = titleArgb;
+            t2.bold = true;
+            runs.push_back(t2);
+
+            TextRun b1;
+            b1.text = "You can recover or remove from";
+            b1.x = p.x + 24.0f * d;
+            b1.y = t2.y + 30.0f * d;
+            b1.fontSizePx = 14.5f * d;
+            b1.argb = bodyArgb;
+            b1.bold = false;
+            runs.push_back(b1);
+
+            TextRun b2;
+            b2.text = "Recently Deleted within 30 days.";
+            b2.x = p.x + 24.0f * d;
+            b2.y = b1.y + 19.0f * d;
+            b2.fontSizePx = 14.5f * d;
+            b2.argb = bodyArgb;
+            b2.bold = false;
+            runs.push_back(b2);
             return true;
         }
         case static_cast<int>(Scene::kLockScreen): {
@@ -3286,7 +3454,21 @@ void GlesRenderer::DrawButtonsScene(int w, int h) {
         s.samplePivotY = r.y + r.h * 0.5f;
         DrawGlass(s, 0, w, h);
     }
-    DrawOverlayText(w, h);
+    if (buttonLabelTex_[0] == 0) {
+        UploadButtonLabels(w, h);
+    }
+    for (int i = 0; i < 4; i++) {
+        if (buttonLabelTex_[i] == 0) {
+            continue;
+        }
+        const RectF r = ButtonRectAt(w, h, d, i);
+        const float scale = 1.0f + (4.0f * d) / r.h * press[i];
+        const float cx = r.x + r.w * 0.5f;
+        const float cy = r.y + r.h * 0.5f;
+        const float drawW = r.w * scale;
+        const float drawH = r.h * scale;
+        DrawSprite(buttonLabelTex_[i], cx - drawW * 0.5f, cy - drawH * 0.5f, drawW, drawH, w, h);
+    }
 }
 
 void GlesRenderer::DrawToggleScene(int w, int h) {
@@ -3408,15 +3590,18 @@ void GlesRenderer::DrawSliderScene(int w, int h) {
 
 void GlesRenderer::DrawDialogScene(int w, int h) {
     const float d = params_.Density();
-    float press[2] = {0.0f, 0.0f};
+    float press = 0.0f;
+    float scale = 1.0f;
     {
         std::lock_guard<std::mutex> lock(animMutex_);
-        press[0] = dialogPress_[0];
-        press[1] = dialogPress_[1];
+        press = dialogPress_[0];
+        scale = dialogScale_;
     }
     const RectF panel = DialogPanelRect(w, h, d);
+    const float panelCenterX = panel.x + panel.w * 0.5f;
+    const float panelCenterY = panel.y + panel.h * 0.5f;
 
-    // ---- 内容层：暗化（dimColor = #121212 alpha 0.56）----
+    // ---- 1. 背景暗化（参数 pid::kDialogDimAlpha，94）----
     glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo_);
     glViewport(0, 0, w, h);
     glEnable(GL_BLEND);
@@ -3426,60 +3611,130 @@ void GlesRenderer::DrawDialogScene(int w, int h) {
     dim.y = 0.0f;
     dim.w = static_cast<float>(w);
     dim.h = static_cast<float>(h);
-    dim.a = 0.56f;
-    dim.colorR = 0.0706f;
-    dim.colorG = 0.0706f;
-    dim.colorB = 0.0706f;
+    dim.a = params_.N(pid::kDialogDimAlpha);
+    dim.colorR = 0.02f;
+    dim.colorG = 0.03f;
+    dim.colorB = 0.05f;
     DrawSolid(dim, w, h);
     glDisable(GL_BLEND);
+
+    // ---- 2. 玻璃对话框底板（参数 95..116 + 开关 8..11）----
+    const float panelRadiusPx = params_.Px(pid::kDialogCornerRadius);
+    GlassSpec s = DefaultGlass(panel.x, panel.y, panel.w, panel.h, panelRadiusPx, d);
+    s.useBackground = true;
+    s.scaleX = scale;
+    s.scaleY = scale;
+    s.g2Factor = params_.N(pid::kDialogG2Factor);
+    s.blurRadiusPx = params_.Px(pid::kDialogBlurRadius);
+    s.refractionHeight = params_.Px(pid::kDialogRefractionHeight);
+    s.refractionAmount = params_.Px(pid::kDialogRefractionAmount);
+    s.rimClarity = params_.N(pid::kDialogRimClarity);
+    s.bevelAlphaScale = params_.N(pid::kDialogBevelAlphaScale);
+    s.vibrancy = params_.N(pid::kDialogVibrancy);
+    s.brightness = params_.N(pid::kDialogBrightness);
+    s.contrast = params_.N(pid::kDialogContrast);
+    s.dispersion = params_.B(bid::kDialogDispersion);
+    s.depthEffect = params_.B(bid::kDialogDepthEffect);
+    s.ambient = params_.B(bid::kDialogAmbient);
+    s.plainHighlight = params_.B(bid::kDialogPlainHighlight);
+    s.surfaceAlpha = params_.N(pid::kDialogSurfaceAlpha);
+    s.surfaceR = params_.N(pid::kDialogSurfaceR);
+    s.surfaceG = params_.N(pid::kDialogSurfaceG);
+    s.surfaceB = params_.N(pid::kDialogSurfaceB);
+    s.highlight = params_.N(pid::kDialogHighlight);
+    s.highlightWidthPx = std::max(1.0f, params_.Px(pid::kDialogHighlightWidth));
+    s.highlightBlurPx = s.highlightWidthPx * 0.5f;
+    s.ambientIntensity = params_.N(pid::kDialogAmbientIntensity);
+    s.innerRadiusPx = params_.Px(pid::kDialogInnerRadius);
+    s.innerAlpha = params_.N(pid::kDialogInnerAlpha);
+    s.hasShadow = params_.N(pid::kDialogShadowAlpha) > 0.001f;
+    s.shadowBlurPx = params_.Px(pid::kDialogShadowBlur);
+    s.shadowOffsetPx = params_.Px(pid::kDialogShadowOffset);
+    s.shadowAlpha = params_.N(pid::kDialogShadowAlpha);
+    DrawGlass(s, sceneFbo_, w, h);
+
+    // 将暗化背景与底板画面整体 blit 到屏幕 target 0
     BlitTexture(sceneTex_, w, h);
 
-    // ---- 玻璃面板（drawBackdrop: colorControls + blur(8dp) + lens(24dp, 48dp, depth)）----
-    GlassSpec s = DefaultGlass(panel.x, panel.y, panel.w, panel.h, 48.0f * d, d);
-    s.saturation = 1.5f;
-    s.blurRadiusPx = 8.0f * d;
-    s.refractionHeight = 24.0f * d;
-    s.refractionAmount = 48.0f * d;
-    s.depthEffect = true;
-    s.plainHighlight = true;
-    s.highlight = kPlainHighlight;   // Highlight.Plain（见 kPlainHighlight 的配平说明）
-    s.surfaceAlpha = 0.4f;
-    s.surfaceR = 0.0706f;  // containerColor = #121212 alpha 0.4
-    s.surfaceG = 0.0706f;
-    s.surfaceB = 0.0706f;
-    DrawGlass(s, 0, w, h);
+    // ---- 3. 单个全宽 OK 液态玻璃胶囊按钮（参数 117..139 + 开关 12..15）----
+    RectF btn;
+    DialogButtonRects(w, h, d, &btn);
+    const float btnCenterX = panelCenterX + (btn.x + btn.w * 0.5f - panelCenterX) * scale;
+    const float btnCenterY = panelCenterY + (btn.y + btn.h * 0.5f - panelCenterY) * scale;
+    const float pressGrowPx = params_.Px(pid::kDialogBtnPressGrow);
+    const float btnScale = 1.0f + (btn.h > 1.0f ? pressGrowPx / btn.h : 0.0f) * press;
+    const float totalScale = scale * btnScale;
+    const float drawBtnW = btn.w * totalScale;
+    const float drawBtnH = btn.h * totalScale;
 
-    // ---- 按钮（纯色胶囊，参考实现里不是玻璃）----
-    RectF buttons[2];
-    DialogButtonRects(w, h, d, buttons);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    for (int i = 0; i < 2; i++) {
-        SolidSpec button;
-        const float scale = 1.0f + 0.02f * press[i];
-        const float bw = buttons[i].w * scale;
-        const float bh = buttons[i].h * scale;
-        button.x = buttons[i].x + (buttons[i].w - bw) * 0.5f;
-        button.y = buttons[i].y + (buttons[i].h - bh) * 0.5f;
-        button.w = bw;
-        button.h = bh;
-        button.r = bh * 0.5f;
-        if (i == 0) {
-            // containerColor.copy(alpha = 0.2f) → #121212 @ 0.4 × 0.2 = 0.08
-            button.a = 0.08f;
-            button.colorR = 0.0706f;
-            button.colorG = 0.0706f;
-            button.colorB = 0.0706f;
+    const float btnRadiusPx = params_.Px(pid::kDialogBtnCornerRadius) * scale;
+    GlassSpec bs = DefaultGlass(btnCenterX - btn.w * 0.5f * scale,
+                                btnCenterY - btn.h * 0.5f * scale,
+                                btn.w * scale, btn.h * scale,
+                                btnRadiusPx, d);
+    bs.useBackground = false;  // 采样 sceneTex_（包含通透底板与折射纹理）
+    bs.g2Factor = params_.N(pid::kDialogBtnG2Factor);
+    bs.blurRadiusPx = params_.Px(pid::kDialogBtnBlurRadius);
+    bs.refractionHeight = params_.Px(pid::kDialogBtnRefractionHeight);
+    bs.refractionAmount = params_.Px(pid::kDialogBtnRefractionAmount);
+    bs.rimClarity = params_.N(pid::kDialogBtnRimClarity);
+    bs.bevelAlphaScale = params_.N(pid::kDialogBtnBevelAlphaScale);
+    bs.vibrancy = params_.N(pid::kDialogBtnVibrancy);
+    bs.brightness = params_.N(pid::kDialogBtnBrightness);
+    bs.contrast = params_.N(pid::kDialogBtnContrast);
+    bs.dispersion = params_.B(bid::kDialogBtnDispersion);
+    bs.depthEffect = params_.B(bid::kDialogBtnDepthEffect);
+    bs.ambient = params_.B(bid::kDialogBtnAmbient);
+    bs.plainHighlight = params_.B(bid::kDialogBtnPlainHighlight);
+    bs.surfaceAlpha = params_.N(pid::kDialogBtnSurfaceAlpha);
+    bs.surfaceR = params_.N(pid::kDialogBtnSurfaceR);
+    bs.surfaceG = params_.N(pid::kDialogBtnSurfaceG);
+    bs.surfaceB = params_.N(pid::kDialogBtnSurfaceB);
+    bs.highlight = params_.N(pid::kDialogBtnHighlight);
+    bs.highlightWidthPx = std::max(1.0f, params_.Px(pid::kDialogBtnHighlightWidth));
+    bs.highlightBlurPx = bs.highlightWidthPx * 0.5f;
+    bs.ambientIntensity = params_.N(pid::kDialogBtnAmbientIntensity);
+    bs.innerRadiusPx = params_.Px(pid::kDialogBtnInnerRadius);
+    bs.innerAlpha = params_.N(pid::kDialogBtnInnerAlpha);
+    bs.hasShadow = params_.N(pid::kDialogBtnShadowAlpha) > 0.001f;
+    bs.shadowBlurPx = params_.Px(pid::kDialogBtnShadowBlur);
+    bs.shadowOffsetPx = params_.Px(pid::kDialogBtnShadowOffset);
+    bs.shadowAlpha = params_.N(pid::kDialogBtnShadowAlpha);
+    bs.sampleScaleX = 1.0f;
+    bs.sampleScaleY = 1.0f;
+    bs.scaleX = btnScale;
+    bs.scaleY = btnScale;
+
+    DrawGlass(bs, 0, w, h);
+
+    // ---- 4. 对话框文字图层（标题与正文随 dialogScale 缩放）----
+    if (overlayTextTex_ != 0 && overlayTextW_ > 0 && overlayTextH_ > 0) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        if (std::fabs(scale - 1.0f) > 0.001f) {
+            const float drawW = static_cast<float>(w) * scale;
+            const float drawH = static_cast<float>(h) * scale;
+            const float drawX = panelCenterX - panelCenterX * scale;
+            const float drawY = panelCenterY - panelCenterY * scale;
+            DrawSprite(overlayTextTex_, drawX, drawY, drawW, drawH, w, h);
         } else {
-            button.a = 1.0f;
-            button.colorR = kAccentR;
-            button.colorG = kAccentG;
-            button.colorB = kAccentB;
+            DrawSprite(overlayTextTex_, overlayTextX_, overlayTextY_,
+                       static_cast<float>(overlayTextW_), static_cast<float>(overlayTextH_), w, h);
         }
-        DrawSolid(button, w, h);
+        glDisable(GL_BLEND);
     }
-    glDisable(GL_BLEND);
-    DrawOverlayText(w, h);
+
+    // ---- 5. 按钮文字图层（随按钮按压放大与入场缩放同步放大）----
+    if (dialogBtnLabelTex_ == 0 || dialogBtnLabelW_ != static_cast<int>(std::ceil(btn.w))) {
+        UploadDialogBtnLabel(w, h);
+    }
+    if (dialogBtnLabelTex_ != 0) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        DrawSprite(dialogBtnLabelTex_, btnCenterX - drawBtnW * 0.5f, btnCenterY - drawBtnH * 0.5f,
+                   drawBtnW, drawBtnH, w, h);
+        glDisable(GL_BLEND);
+    }
 }
 
 void GlesRenderer::DrawControlCenterScene(int w, int h) {
@@ -4031,7 +4286,7 @@ void GlesRenderer::DrawArkTsGlassScene(int w, int h) {
     // 大卡片压在中间的三张卡片上，胶囊压在滑块那一行上。
     const float marginH = 20.0f * d;
     const float cardW = static_cast<float>(w) - marginH * 2.0f;
-    const float cardTop = 224.0f * d;
+    const float cardTop = 190.0f * d;
     const float cardH = 150.0f * d;
     GlassSpec card = DefaultGlass(marginH, static_cast<float>(h) - cardTop - cardH, cardW, cardH,
                                   28.0f * d, d);
@@ -4043,7 +4298,7 @@ void GlesRenderer::DrawArkTsGlassScene(int w, int h) {
     card.surfaceAlpha = 0.06f;
     DrawGlass(card, 0, w, h);
 
-    const float pillTop = 442.0f * d;
+    const float pillTop = 408.0f * d;
     const float pillH = 60.0f * d;
     GlassSpec pill = DefaultGlass(marginH, static_cast<float>(h) - pillTop - pillH, cardW, pillH,
                                   pillH * 0.5f, d);
@@ -4229,6 +4484,11 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
     // 底板圆角半径（参数 68）：钳到"高度一半"上限，超过就是胶囊
     const float panelRadius = std::min(params_.Px(pid::kPanelCornerRadius), barH * 0.5f);
 
+    // 静止/拖动两组值按 press 线性插值（与参考实现的 lerp(rest, drag, press) 一致）
+    const auto lerpN = [this](int restId, int dragId, float t) {
+        return params_.N(restId) + (params_.N(dragId) - params_.N(restId)) * t;
+    };
+
     // 底板按压缩放（参数 5，对齐参考实现的 GlassPanel 的 layerBlock）：
     //   scale = lerp(1, 1 + pressGrowth.px / 底板宽, press)
     // 以底板中心为锚点。参考实现里这个缩放只作用于**玻璃层**（文字与指示器不跟着缩放），
@@ -4263,9 +4523,14 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
     // 目录场景新增的 uniform 在底板 pass 上保持"恒等"值，外观与旧版逐像素一致
     glUniform1f(glGetUniformLocation(progGlass_, "uScaleX"), 1.0f);
     glUniform1f(glGetUniformLocation(progGlass_, "uScaleY"), 1.0f);
-    glUniform3f(glGetUniformLocation(progGlass_, "uSurfaceColor"), 1.0f, 1.0f, 1.0f);
+    glUniform3f(glGetUniformLocation(progGlass_, "uSurfaceColor"),
+                params_.N(pid::kSurfaceColorR), params_.N(pid::kSurfaceColorG),
+                params_.N(pid::kSurfaceColorB));
     glUniform2f(glGetUniformLocation(progGlass_, "uSampleScale"), 1.0f, 1.0f);
     glUniform2f(glGetUniformLocation(progGlass_, "uSamplePivot"), 0.0f, 0.0f);
+    glUniform1f(glGetUniformLocation(progGlass_, "uG2Factor"), 0.45f);
+    glUniform1f(glGetUniformLocation(progGlass_, "uRimClarity"), 0.0f);
+    glUniform1f(glGetUniformLocation(progGlass_, "uBevelAlphaScale"), 1.0f);
     glUniform1f(glGetUniformLocation(progGlass_, "uAmbientIntensity"), 0.38f);
     glUniform1f(glGetUniformLocation(progGlass_, "uBlurRadius"), blurRadius);
     glUniform1f(glGetUniformLocation(progGlass_, "uVibrancy"), params_.B(1) ? 1.5f : 1.0f);  // 提饱和
@@ -4283,10 +4548,14 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
     glUniform1f(glGetUniformLocation(progGlass_, "uHighlightWidth"), hlWidthPx);
     glUniform1f(glGetUniformLocation(progGlass_, "uHighlightBlur"), hlWidthPx * 0.5f);
     glUniform1f(glGetUniformLocation(progGlass_, "uAmbient"), params_.B(5) ? 1.0f : 0.0f);
-    // 外投影：模糊半径 / 向下偏移 / 有效不透明度（参数 70/71/72）
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadowBlur"), params_.Px(pid::kShadowBlur));
+    // 外投影：模糊半径 / 向下偏移 / 有效不透明度（参数 70/71/72）。
+    // 按压时换成"大范围 / 更弱 / 更散"的一圈（参数 92/93）：胶囊鼓出底板后，贴着
+    // 轮廓的窄投影会紧贴鼓出的胶囊露出一圈暗边，大模糊 + 低强度的环境影既避开暗边，又给按压鼓出留出体积感。
+    glUniform1f(glGetUniformLocation(progGlass_, "uShadowBlur"),
+                lerpN(pid::kShadowBlur, pid::kShadowBlurPress, animPress) * params_.Density());
     glUniform1f(glGetUniformLocation(progGlass_, "uShadowOffset"), params_.Px(pid::kShadowOffset));
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadowAlpha"), params_.N(pid::kShadowAlpha));
+    glUniform1f(glGetUniformLocation(progGlass_, "uShadowAlpha"),
+                lerpN(pid::kShadowAlpha, pid::kShadowAlphaPress, animPress));
     // 页签文字**不**进场景纹理：它由 pass 5 叠加（形状外常态色 / 形状内凸显色）。
     // 若在这里画进场景，指示器的透镜会先采到常态字形，再叠凸显色字形 —— 两套重影，
     // 而且拖动时常态字形会被透镜拖着一起动（参考实现里文字是不动的）。
@@ -4381,10 +4650,15 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
     const float squash = std::max(-0.2f, std::min(0.2f, v * params_.N(pid::kVelocitySquash)));
     const float scaleX = 1.0f / (1.0f - stretch);
     const float scaleY = 1.0f * (1.0f - squash);
-    // 按压 = **等边距膨胀**（不再是绕中心等比缩放）：
-    // 竖向每边增长 = indH*(按压缩放弹簧-1)/2，横向同样多，所以四周超出量完全相等。
-    // 旧写法 scaleX/scaleY 同时用按压缩放，因胶囊"宽 ≫ 高"，横向每边长的量会大一倍多。
-    const float inflate = std::max(0.0f, indH * 0.5f * (animScaleY - 1.0f));
+    // 按压放大 = 形状缩放（纵向 id 51 / 横向 id 82 的弹簧目标）：撑大胶囊形状。
+    // 横纵分开：纵向鼓得多、横向收着长（HallPass 观感微调）。
+    // 采样缩放（参数 81）与形状缩放解耦：形状向外膨胀的同时，胶囊里看到的底座 / 文字
+    // 绕胶囊中心**缩微** —— 两者方向相反，合起来才是"液态透镜被按下去"的观感。
+    // 下限 0.5 是防御：参数走 SetNumber 进来不设边界，极端值下别把采样缩到 0 / 负数。
+    const float pressScaleX = std::max(1.0f, animScaleX);
+    const float pressScaleY = std::max(1.0f, animScaleY);
+    const float contentScale =
+        std::max(0.5f, 1.0f - params_.N(pid::kPressSampleShrink) * animPress);
 
     glUniform4f(glGetUniformLocation(progIndicator_, "uRect"), indX, indY, indW, indH);
     // 胶囊 = 四角等半径
@@ -4405,20 +4679,10 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
                 params_.N(pid::kPressLabelScale) * animPress);
     glUniform1f(glGetUniformLocation(progIndicator_, "uScaleX"), scaleX);
     glUniform1f(glGetUniformLocation(progIndicator_, "uScaleY"), scaleY);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uInflate"), inflate);
-    // 按压采样缩小（参数 81）：形状向外膨胀的同时，玻璃里看到的底座/文字绕胶囊中心缩微 ——
-    // 两者方向相反，合起来才是"液态透镜被按下去"的观感。下限 0.5 是防御：
-    // 参数走 SetNumber 进来不设边界，极端值下别把采样缩到 0 / 负数。
-    const float indSampleScale =
-        std::max(0.5f, 1.0f - params_.N(pid::kPressSampleShrink) * animPress);
-    glUniform2f(glGetUniformLocation(progIndicator_, "uSampleScale"), indSampleScale,
-                indSampleScale);
-    glUniform2f(glGetUniformLocation(progIndicator_, "uSamplePivot"), indX + indW * 0.5f,
-                indY + indH * 0.5f);
+    glUniform1f(glGetUniformLocation(progIndicator_, "uShapeScaleX"), pressScaleX);
+    glUniform1f(glGetUniformLocation(progIndicator_, "uShapeScaleY"), pressScaleY);
+    glUniform1f(glGetUniformLocation(progIndicator_, "uPressScale"), contentScale);
     // 指示器透镜：静止/拖动两组值按 press 线性插值（与参考实现的 lerp(rest, drag, press) 一致）
-    const auto lerpN = [this](int restId, int dragId, float t) {
-        return params_.N(restId) + (params_.N(dragId) - params_.N(restId)) * t;
-    };
     const float lensH = lerpN(pid::kRefractionHeightRest, pid::kRefractionHeightDrag, animPress);
     const float lensA = lerpN(pid::kRefractionAmountRest, pid::kRefractionAmountDrag, animPress);
     glUniform1f(glGetUniformLocation(progIndicator_, "uRefractionHeight"),
@@ -4440,16 +4704,19 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
                 lerpN(pid::kHighlightRest, pid::kHighlightDrag, animPress));
     glUniform1f(glGetUniformLocation(progIndicator_, "uHighlightWidth"), hlWidthPx);
     glUniform1f(glGetUniformLocation(progIndicator_, "uHighlightBlur"), hlWidthPx * 0.5f);
-    // 指示器投影：几何与底板相同，强度 = 基础 alpha × lerp(静止 0.22, 拖动 1.0, press)
-    glUniform1f(glGetUniformLocation(progIndicator_, "uShadowBlur"), params_.Px(pid::kShadowBlur));
+    // 外缘细灰线：按压态渐入（非常微弱，只做轮廓对比用；静止态为 0）
+    glUniform1f(glGetUniformLocation(progIndicator_, "uEdgeLine"), 0.28f * animPress);
+    // 指示器投影：对齐滑块旋钮按压态的"贴边投影"，但走"更大范围 / 更柔 / 更淡"档：
+    // 模糊 9→11dp、下移 2→1.5dp、强度 0.045→0.06，随 press 渐入。
+    // 按压时启用反向纵向渐变（uShadowSpreadV = press）：影子只落在轮廓下方 / 两侧（顶边不投）。
+    const float indShadowDp = params_.Density();
+    glUniform1f(glGetUniformLocation(progIndicator_, "uShadowBlur"),
+                (9.0f + 2.0f * animPress) * indShadowDp);
     glUniform1f(glGetUniformLocation(progIndicator_, "uShadowOffset"),
-                params_.Px(pid::kShadowOffset));
-    // 指示器投影：上游 Shadow 的黑 alpha 上限只有 0.1，乘 kShadowAlpha 后按压最多 0.09，
-    // 不足以在底座上形成"断开"的暗圈。这里额外 ×3（按压 ≈0.27）让鼓出部分与底座分离，
-    // 做出 iOS 那种空隙感。衰减半径仍用底座的 uShadowBlur。
+                (2.0f - 0.5f * animPress) * indShadowDp);
     glUniform1f(glGetUniformLocation(progIndicator_, "uShadowAlpha"),
-                params_.N(pid::kShadowAlpha) * 3.0f *
-                    lerpN(pid::kShadowRest, pid::kShadowDrag, animPress));
+                (0.045f + 0.015f * animPress) * animPress);
+    glUniform1f(glGetUniformLocation(progIndicator_, "uShadowSpreadV"), animPress);
     // 内阴影：半径/强度两组值按 press 插值；强度再乘上游 InnerShadow 的颜色黑 alpha 0.15
     glUniform1f(glGetUniformLocation(progIndicator_, "uInnerRadius"),
                 lerpN(pid::kInnerShadowRadiusRest, pid::kInnerShadowRadiusDrag, animPress) *
@@ -4506,6 +4773,9 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
     glUniform3f(glGetUniformLocation(progGlass_, "uSurfaceColor"), 1.0f, 1.0f, 1.0f);
     glUniform2f(glGetUniformLocation(progGlass_, "uSampleScale"), 1.0f, 1.0f);
     glUniform2f(glGetUniformLocation(progGlass_, "uSamplePivot"), 0.0f, 0.0f);
+    glUniform1f(glGetUniformLocation(progGlass_, "uG2Factor"), 0.45f);
+    glUniform1f(glGetUniformLocation(progGlass_, "uRimClarity"), 0.0f);
+    glUniform1f(glGetUniformLocation(progGlass_, "uBevelAlphaScale"), 1.0f);
     glUniform1f(glGetUniformLocation(progGlass_, "uAmbientIntensity"), 0.38f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glDisable(GL_SCISSOR_TEST);
@@ -4567,6 +4837,9 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
         glUniform1f(glGetUniformLocation(progGlass_, "uScaleX"), 1.0f);
         glUniform1f(glGetUniformLocation(progGlass_, "uScaleY"), 1.0f);
         glUniform3f(glGetUniformLocation(progGlass_, "uSurfaceColor"), 1.0f, 1.0f, 1.0f);
+        glUniform1f(glGetUniformLocation(progGlass_, "uG2Factor"), 0.0f);
+        glUniform1f(glGetUniformLocation(progGlass_, "uRimClarity"), 0.0f);
+        glUniform1f(glGetUniformLocation(progGlass_, "uBevelAlphaScale"), 1.0f);
         // uSampleScale / uSamplePivot 是**逐按钮**的（见下面循环），这里不再设恒等值
         glUniform1f(glGetUniformLocation(progGlass_, "uAmbientIntensity"), 0.38f);
 
@@ -4738,6 +5011,14 @@ void GlesRenderer::RenderLoop(void *window) {
         }
         if (overlayTextDirty_.exchange(false)) {
             UploadOverlayText(targetW_, targetH_);
+            uploads = true;
+        }
+        if (buttonLabelsDirty_.exchange(false)) {
+            UploadButtonLabels(targetW_, targetH_);
+            uploads = true;
+        }
+        if (dialogBtnLabelDirty_.exchange(false)) {
+            UploadDialogBtnLabel(targetW_, targetH_);
             uploads = true;
         }
         // 顶部按钮的图标位图：尺寸（19dp × density）变了才需要重传

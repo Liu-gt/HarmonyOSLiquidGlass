@@ -210,6 +210,19 @@ napi_value SetPaused(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+napi_value SetDarkMode(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1 || args[0] == nullptr) {
+        return nullptr;
+    }
+    bool dark = false;
+    napi_get_value_bool(env, args[0], &dark);
+    GlesRenderer::Instance().SetDarkMode(dark);
+    return nullptr;
+}
+
 napi_value SetPhoto(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1] = {nullptr};

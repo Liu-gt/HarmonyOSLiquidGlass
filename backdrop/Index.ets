@@ -12,6 +12,7 @@ export {
   GlassGLSetBool,
   GlassGLSetDebugMode,
   GlassGLSetPaused,
+  GlassGLSetDarkMode,
   GlassGLSetPhoto,
   GlassGLGetContentSurfaceId,
   GlassGLIsRunning,

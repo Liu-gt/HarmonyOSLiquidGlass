@@ -4,15 +4,25 @@ import {
   GlassGLGetContentSurfaceId,
   GlassGLRegisterMenuCallback,
   GlassGLSetBool,
+  GlassGLSetDarkMode,
   GlassGLSetDensity,
   GlassGLSetNumber,
   GlassGLSetPhoto,
   GlassGLSetScene,
   GlassGLUnregisterMenuCallback
 } from 'backdrop';
-import { NumberSpec, ToggleSpec, NUMBER_SPECS, TOGGLE_SPECS, buildDefaults } from './Specs';
+import {
+  NumberSpec,
+  ToggleSpec,
+  NUMBER_SPECS,
+  TOGGLE_SPECS,
+  DIALOG_NUMBER_SPECS,
+  DIALOG_TOGGLE_SPECS,
+  buildDefaults,
+  buildToggleDefaults
+} from './Specs';
 import { ARKTS_GLASS_CONTENT } from './ArkTsGlassContent';
-import { SCENE_ARKTS_GLASS } from './Scenes';
+import { SCENE_ARKTS_GLASS, SCENE_DIALOG } from './Scenes';
 
 const DOMAIN = 0x0000;
 const TAG = 'GLASS';
@@ -96,10 +106,17 @@ export struct ScenePage {
   @State menuOpen: boolean = false;
   @State activeGroup: number = 0;
   @State values: number[] = buildDefaults();
-  @State toggles: boolean[] = [true, true, true, false, false, false, false, false];
+  @State toggles: boolean[] = buildToggleDefaults();
   @State resetNonce: number = 0;
   /** 原生侧就绪后拿到的内容纹理 surfaceId（非空才挂 NodeContainer） */
   @State contentSurfaceId: string = '';
+  @StorageProp('isDarkMode') @Watch('onDarkModeChange') isDarkMode: boolean = false;
+
+  private onDarkModeChange(): void {
+    if (GlassGLSetDarkMode !== undefined) {
+      GlassGLSetDarkMode(this.isDarkMode);
+    }
+  }
 
   private alive: boolean = true;
   private contentPollTimer: number = -1;
@@ -108,14 +125,26 @@ export struct ScenePage {
   aboutToAppear(): void {
     // 原生侧按 dp 排版：把本设备的显示密度报上去（vp -> px）
     GlassGLSetDensity(this.getUIContext().vp2px(1));
+    if (GlassGLSetDarkMode !== undefined) {
+      const isDark: boolean = AppStorage.get<boolean>('isDarkMode') ?? false;
+      GlassGLSetDarkMode(isDark);
+    }
 
     if (this.showMenu) {
       // 页签场景：把描述表里的默认值推给原生渲染器（其它场景用固定参考值）
-      for (let i = 0; i < this.values.length; i++) {
-        GlassGLSetNumber(i, this.values[i]);
+      for (let i = 0; i < NUMBER_SPECS.length; i++) {
+        GlassGLSetNumber(NUMBER_SPECS[i].id, this.values[NUMBER_SPECS[i].id]);
       }
-      for (let i = 0; i < this.toggles.length; i++) {
-        GlassGLSetBool(i, this.toggles[i]);
+      for (let i = 0; i < TOGGLE_SPECS.length; i++) {
+        GlassGLSetBool(TOGGLE_SPECS[i].id, this.toggles[TOGGLE_SPECS[i].id]);
+      }
+    } else if (this.sceneId === SCENE_DIALOG) {
+      // Dialog 场景：把「弹窗·材质 / 按钮·材质」的定版默认值推给原生渲染器
+      for (let i = 0; i < DIALOG_NUMBER_SPECS.length; i++) {
+        GlassGLSetNumber(DIALOG_NUMBER_SPECS[i].id, this.values[DIALOG_NUMBER_SPECS[i].id]);
+      }
+      for (let i = 0; i < DIALOG_TOGGLE_SPECS.length; i++) {
+        GlassGLSetBool(DIALOG_TOGGLE_SPECS[i].id, this.toggles[DIALOG_TOGGLE_SPECS[i].id]);
       }
     }
 

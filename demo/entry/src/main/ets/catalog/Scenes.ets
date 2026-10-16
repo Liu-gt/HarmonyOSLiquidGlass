@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 export const SCENE_TABS: number = 0;
+export const SCENE_DIALOG: number = 4;
 
 /**
  * ArkTS 实时内容玻璃：XComponent 仍是 `glassSurface`，但背景换成 ArkUI 自己渲染的

@@ -7,8 +7,8 @@
 // 动画（LoadingProgress / TextClock）与交互（Slider / Toggle）都能透出来。
 //
 // 布局里的 vp 数值与原生 `DrawArkTsGlassScene` 的玻璃几何对应：
-//   卡片区 224..374vp  -> 大玻璃卡片
-//   滑块区 450..494vp  -> 玻璃胶囊
+//   卡片区 190..340vp  -> 大玻璃卡片
+//   滑块区 416..460vp  -> 玻璃胶囊
 // 改这里的位置时记得同步改那边（反之亦然）。
 // ---------------------------------------------------------------------------
 
@@ -28,7 +28,6 @@ export const ARKTS_GLASS_CONTENT: WrappedBuilder<[]> = wrapBuilder(arkTsGlassCon
 @Component
 export struct ArkTsGlassContent {
   @State value: number = 35;
-  @State on: boolean = true;
 
   @Builder
   card(colorA: string, colorB: string, title: string) {
@@ -57,12 +56,6 @@ export struct ArkTsGlassContent {
         .fontColor(Color.White)
         .height(40)
 
-      Text('这块 UI 由 ArkUI 渲染，经 BuilderNode 导出为纹理后直接被 GL 采样 —— 玻璃里是实时画面，不是截图。')
-        .fontSize(13)
-        .lineHeight(18)
-        .fontColor('#99FFFFFF')
-        .height(36)
-
       // ---- 卡片区（190..340vp）：大玻璃卡片压在这里 ----
       Row({ space: 12 }) {
         this.card('#FF7A45', '#FF3B6B', '折射')
@@ -71,7 +64,7 @@ export struct ArkTsGlassContent {
       }
       .width('100%')
       .height(150)
-      .margin({ top: 18 })
+      .margin({ top: 20 })
 
       // ---- 实时性证明：转圈 + 每秒跳动的时钟 ----
       Row({ space: 12 }) {
@@ -113,19 +106,6 @@ export struct ArkTsGlassContent {
       .height(44)
       .margin({ top: 12 })
 
-      Row() {
-        Text('玻璃开关')
-          .fontSize(14)
-          .fontColor('#E0FFFFFF')
-          .layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.on })
-          .onChange((isOn: boolean) => {
-            this.on = isOn;
-          })
-      }
-      .width('100%')
-      .height(44)
-      .margin({ top: 12 })
 
       Blank()
     }

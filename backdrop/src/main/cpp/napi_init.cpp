@@ -20,6 +20,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"GlassGLSetDensity", nullptr, glass::SetDensity, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"GlassGLSetDebugMode", nullptr, glass::SetDebugMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"GlassGLSetPaused", nullptr, glass::SetPaused, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"GlassGLSetDarkMode", nullptr, glass::SetDarkMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"GlassGLIsRunning", nullptr, glass::IsRunning, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"GlassGLSetPhoto", nullptr, glass::SetPhoto, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"GlassGLGetContentSurfaceId", nullptr, glass::GetContentSurfaceId, nullptr, nullptr, nullptr, napi_default, nullptr},

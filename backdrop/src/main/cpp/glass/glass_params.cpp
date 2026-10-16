@@ -19,17 +19,17 @@ GlassParams::GlassParams() {
         bools_[i] = false;
     }
 
-    // ---- 默认值：逐条对齐 glass_params.cpp ----
+    // ---- 默认值：逐条对齐 HallPass 定版值 ----
     // 底座 · 材质
-    values_[0] = 50.0f;    // barHeight
-    values_[1] = 0.2f;     // blurRadius
-    values_[2] = 12.0f;    // refractionHeight
-    values_[3] = 30.0f;    // refractionAmount
-    values_[4] = 0.5f;     // containerAlpha
-    values_[5] = 3.0f;     // pressGrowth
-    values_[6] = 0.07f;    // glowFlat
-    values_[7] = 0.15f;    // glowRadial
-    values_[8] = 1.5f;     // glowRadiusFactor
+    values_[0] = 56.0f;    // barHeight
+    values_[1] = 0.3f;     // blurRadius
+    values_[2] = 21.0f;    // refractionHeight
+    values_[3] = 18.0f;    // refractionAmount
+    values_[4] = 0.45f;    // containerAlpha
+    values_[5] = 8.0f;     // pressGrowth
+    values_[6] = 0.003f;   // glowFlat
+    values_[7] = 0.008f;   // glowRadial
+    values_[8] = 1.0f;     // glowRadiusFactor
     // 底座 · 按钮
     values_[9] = 46.0f;    // iconButtonSize
     values_[10] = 4.0f;    // iconBlurBase
@@ -45,11 +45,11 @@ GlassParams::GlassParams() {
     // 底座 · 布局
     values_[20] = 14.0f;   // panelInnerPadding
     values_[21] = 4.0f;    // panelParallax
-    values_[22] = 48.0f;   // outerPaddingH
-    values_[23] = 26.0f;   // outerPaddingV
-    values_[24] = 14.0f;   // labelFontSize
+    values_[22] = 64.0f;   // outerPaddingH
+    values_[23] = 24.0f;   // outerPaddingV
+    values_[24] = 8.0f;    // labelFontSize
     values_[25] = 1.0f;    // labelSelectedAlpha
-    values_[26] = 0.62f;   // labelUnselectedAlpha
+    values_[26] = 0.65f;   // labelUnselectedAlpha
     // 底座 · 动画
     values_[27] = 1.0f;    // panelReturnDamping
     values_[28] = 300.0f;  // panelReturnStiffness
@@ -60,26 +60,26 @@ GlassParams::GlassParams() {
     // 指示器 · 静止
     values_[33] = 0.0f;    // refractionHeightRest
     values_[34] = 0.0f;    // refractionAmountRest
-    values_[35] = 0.25f;   // tintRest
+    values_[35] = 0.19f;   // tintRest
     values_[36] = 0.0f;    // surfaceWhiteRest
     values_[37] = 0.0f;    // highlightRest
-    values_[38] = 0.2f;    // shadowRest（鼓出时用于和底座分离）
+    values_[38] = 0.0f;    // shadowRest（鼓出时用于和底座分离）
     values_[39] = 0.0f;    // innerShadowRadiusRest
     values_[40] = 0.0f;    // innerShadowAlphaRest
     // 指示器 · 布局
-    values_[41] = 42.0f;   // indicatorHeight（底板 50dp − 上下各 4dp，与旧 60/52 同留白）
+    values_[41] = 48.0f;   // indicatorHeight（底板 56dp − 上下各 4dp）
     values_[42] = 0.0f;    // indicatorPadding
     // 指示器 · 拖动
     values_[43] = 13.0f;   // refractionHeightDrag
-    values_[44] = 25.0f;   // refractionAmountDrag
+    values_[44] = 10.0f;   // refractionAmountDrag
     values_[45] = 0.0f;    // tintDrag
     values_[46] = 0.0f;    // surfaceWhiteDrag
-    values_[47] = 0.0f;    // highlightDrag
-    values_[48] = 0.9f;    // shadowDrag
-    values_[49] = 0.0f;    // innerShadowRadiusDrag
-    values_[50] = 0.0f;    // innerShadowAlphaDrag
+    values_[47] = 0.5f;    // highlightDrag
+    values_[48] = 0.0f;    // shadowDrag
+    values_[49] = 7.0f;    // innerShadowRadiusDrag
+    values_[50] = 0.20f;   // innerShadowAlphaDrag
     // 指示器 · 形变
-    values_[51] = 1.7f;           // pressedScale
+    values_[51] = 1.44f;          // pressedScale
     values_[52] = 0.75f;          // velocityStretch
     values_[53] = 0.4f;           // velocitySquash
     // 指示器 · 动画
@@ -98,15 +98,15 @@ GlassParams::GlassParams() {
     values_[65] = 0.0f;    // indicatorBlurRest
     values_[66] = 0.0f;    // indicatorBlurDrag
     values_[67] = 10.0f;   // indicatorExpand
-    // 追加：底板圆角半径。默认 = 底板高的一半（50/2 = 25dp → 胶囊形状）
-    values_[68] = 25.0f;
-    // 追加：棱边高光环宽（dp）。上游 Highlight.width = 0.5dp，blurRadius = width/2
-    values_[69] = 0.5f;
-    // 追加：外投影（上游 Shadow() 默认值：radius 24dp、offset.y = radius/6、黑 alpha 0.1）
+    // 追加：底板圆角半径
+    values_[68] = 30.0f;
+    // 追加：棱边高光环宽（dp）
+    values_[69] = 0.3f;
+    // 追加：外投影（上游 Shadow() 默认值：radius 24dp、offset.y = 6、黑 alpha 0.07）
     values_[70] = 24.0f;
-    values_[71] = 4.0f;
-    values_[72] = 0.10f;
-    // 追加：浮动件四角圆角（dp）。缺省 25 = 底板圆角，默认外观不变
+    values_[71] = 6.0f;
+    values_[72] = 0.07f;
+    // 追加：浮动件四角圆角（dp）
     values_[73] = 25.0f;   // 左上
     values_[74] = 25.0f;   // 右上
     values_[75] = 25.0f;   // 右下
@@ -116,10 +116,77 @@ GlassParams::GlassParams() {
     values_[78] = 1.0f;    // contrast
     values_[79] = 1.0f;    // saturation
     values_[80] = 1.0f;    // effectOpacity
-    // 追加：按压时指示器内部内容的采样缩小比例（0 = 关，0.1 = 缩到 90%）
-    values_[81] = 0.10f;   // pressSampleShrink
+    // 追加：按压时指示器内部内容的采样缩小比例（HallPass 0.18）
+    values_[81] = 0.18f;   // pressSampleShrink
+    // 追加：按压形状横向放大倍率（HallPass 1.26）
+    values_[82] = 1.26f;   // pressedScaleX
+    // 追加：页签图标尺寸（dp，HallPass 25.6）
+    values_[83] = 25.6f;   // tabIconSize
+    // 追加：表面填充色 RGB
+    values_[84] = 1.0f;
+    values_[85] = 1.0f;
+    values_[86] = 1.0f;
+    // 追加：选中胶囊底色不透明度（静止 / 拖动）
+    values_[87] = 0.0f;
+    values_[88] = 0.0f;
     // 追加：按压时指示器里的页签文字/图标放大比例（0 = 关，0.2 = 放大到 1.2 倍）
-    values_[82] = 0.20f;   // pressLabelScale
+    values_[89] = 0.20f;   // pressLabelScale
+    // 追加：指示器内凸显色文字的图标尺寸 / 字号（dp）
+    values_[90] = 24.4f;   // tabIconSizeAccent
+    values_[91] = 8.0f;    // labelFontSizeAccent
+    // 追加：按压态底板外投影（大范围 / 更弱 / 更散）
+    values_[92] = 40.0f;   // shadowBlurPress
+    values_[93] = 0.035f;  // shadowAlphaPress
+
+    // ---- Dialog · 弹窗材质（94..116）：用户真机调参定版值（PARAMS_DUMP 2026-10-16 12:21）----
+    values_[94] = 0.34f;   // dialogDimAlpha
+    values_[95] = 43.0f;   // dialogCornerRadius (dp)
+    values_[96] = 0.45f;   // dialogG2Factor
+    values_[97] = 3.0f;    // dialogBlurRadius (dp)
+    values_[98] = 35.0f;   // dialogRefractionHeight (dp)
+    values_[99] = 63.5f;   // dialogRefractionAmount (dp)
+    values_[100] = 0.0f;   // dialogRimClarity
+    values_[101] = 0.32f;  // dialogBevelAlphaScale
+    values_[102] = 1.35f;  // dialogVibrancy
+    values_[103] = 0.18f;  // dialogBrightness
+    values_[104] = 1.0f;   // dialogContrast
+    values_[105] = 0.17f;  // dialogSurfaceAlpha
+    values_[106] = 0.96f;  // dialogSurfaceR
+    values_[107] = 0.97f;  // dialogSurfaceG
+    values_[108] = 1.00f;  // dialogSurfaceB
+    values_[109] = 0.40f;  // dialogHighlight
+    values_[110] = 0.65f;  // dialogHighlightWidth (dp)
+    values_[111] = 0.48f;  // dialogAmbientIntensity
+    values_[112] = 0.0f;   // dialogInnerRadius (dp)
+    values_[113] = 0.0f;   // dialogInnerAlpha
+    values_[114] = 45.0f;  // dialogShadowBlur (dp)
+    values_[115] = 5.0f;   // dialogShadowOffset (dp)
+    values_[116] = 0.14f;  // dialogShadowAlpha
+
+    // ---- Dialog · 内部按钮材质（117..139）：用户真机调参定版值 ----
+    values_[117] = 25.0f;  // dialogBtnCornerRadius (dp)
+    values_[118] = 0.0f;   // dialogBtnG2Factor
+    values_[119] = 24.0f;  // dialogBtnBlurRadius (dp)
+    values_[120] = 20.5f;  // dialogBtnRefractionHeight (dp)
+    values_[121] = 40.0f;  // dialogBtnRefractionAmount (dp)
+    values_[122] = 0.0f;   // dialogBtnRimClarity
+    values_[123] = 0.68f;  // dialogBtnBevelAlphaScale
+    values_[124] = 1.40f;  // dialogBtnVibrancy
+    values_[125] = -0.03f; // dialogBtnBrightness
+    values_[126] = 1.0f;   // dialogBtnContrast
+    values_[127] = 0.25f;  // dialogBtnSurfaceAlpha
+    values_[128] = 1.00f;  // dialogBtnSurfaceR
+    values_[129] = 1.00f;  // dialogBtnSurfaceG
+    values_[130] = 1.00f;  // dialogBtnSurfaceB
+    values_[131] = 0.22f;  // dialogBtnHighlight
+    values_[132] = 0.45f;  // dialogBtnHighlightWidth (dp)
+    values_[133] = 0.32f;  // dialogBtnAmbientIntensity
+    values_[134] = 0.0f;   // dialogBtnInnerRadius (dp)
+    values_[135] = 0.0f;   // dialogBtnInnerAlpha
+    values_[136] = 19.0f;  // dialogBtnShadowBlur (dp)
+    values_[137] = 3.0f;   // dialogBtnShadowOffset (dp)
+    values_[138] = 0.050f; // dialogBtnShadowAlpha
+    values_[139] = 1.5f;   // dialogBtnPressGrow (dp)
 
     // ---- 开关 ----
     bools_[0] = false;  // 底座色散（用户定版：默认关）
@@ -130,6 +197,14 @@ GlassParams::GlassParams() {
     bools_[5] = false;  // 环境光（上游 spike 未启用，默认关）
     bools_[6] = false;  // 深度效应（上游页签页未启用，默认关）
     bools_[7] = false;  // 纯色高光（上游默认是描边环，默认关）
+    bools_[8] = false;  // Dialog 弹窗色散（用户真机调参定版值）
+    bools_[9] = false;  // Dialog 弹窗深度效应
+    bools_[10] = true;  // Dialog 弹窗环境光
+    bools_[11] = false; // Dialog 弹窗纯色高光
+    bools_[12] = false; // Dialog 按钮色散（用户真机调参定版值）
+    bools_[13] = true;  // Dialog 按钮深度效应
+    bools_[14] = true;  // Dialog 按钮环境光
+    bools_[15] = false; // Dialog 按钮纯色高光
 }
 
 void GlassParams::SetNumber(int id, float value) {

@@ -56,8 +56,17 @@ public:
     /** 显示密度（vp -> px）。ArkTS 侧在页面上报，缺省 4。 */
     void SetDensity(float density) {
         params_.SetDensity(density);
+        labelsDirty_.store(true);
+        contentTextDirty_.store(true);
+        overlayTextDirty_.store(true);
+        buttonLabelsDirty_.store(true);
+        dialogBtnLabelDirty_.store(true);
         forceRedraw_.store(true);
     }
+
+    /** 深浅色模式同步（深色模式下弹窗等组件自动切换暗色通透玻璃与浅色文字）。 */
+    void SetDarkMode(bool dark);
+    bool IsDarkMode() const { return darkMode_.load(); }
 
     /** 消融/调试：0=正常 1=只画背景 2=只画折射 3=不画玻璃 */
     void SetDebugMode(int mode);
@@ -156,6 +165,9 @@ private:
         float shadowAlpha = 0.0f;
         float innerRadiusPx = 0.0f;
         float innerAlpha = 0.0f;
+        float g2Factor = 0.45f;          // G2 连续曲率平滑系数（0 = 标准圆弧，0.45 = 默认 G2）
+        float rimClarity = 0.38f;        // 边缘清晰折射采样混入比例（0..1）
+        float bevelAlphaScale = 0.68f;   // 边缘折射棱面处表面底色保留比例（0..1）
         // 采样变换（放大镜用）：samplePx = pivot + (px - pivot) / scale
         float sampleScaleX = 1.0f;
         float sampleScaleY = 1.0f;
@@ -248,6 +260,21 @@ private:
     void DrawContentText(int w, int h);
     void DrawOverlayText(int w, int h);
 
+    // 按钮场景的独立文字纹理（各按钮随按压缩放同步缩放）
+    GLuint buttonLabelTex_[4] = {0, 0, 0, 0};
+    int buttonLabelW_[4] = {0, 0, 0, 0};
+    int buttonLabelH_[4] = {0, 0, 0, 0};
+    std::atomic<bool> buttonLabelsDirty_{true};
+    bool UploadButtonLabels(int w, int h);
+
+    // 对话框按钮的独立文字纹理（随按钮按压缩放同步缩放）
+    GLuint dialogBtnLabelTex_ = 0;
+    int dialogBtnLabelW_ = 0;
+    int dialogBtnLabelH_ = 0;
+    std::atomic<bool> dialogBtnLabelDirty_{true};
+    std::atomic<bool> darkMode_{false};
+    bool UploadDialogBtnLabel(int w, int h);
+
     /** 控制中心 / 游乐场的飞机图标（一次性栅格化）。 */
     GLuint planeIconTex_ = 0;
     int planeIconSizePx_ = 0;
@@ -301,10 +328,12 @@ private:
     float sliderScaleY_ = 1.0f;
     float sliderScaleYVel_ = 0.0f;
 
-    // 对话框按钮按压
+    // 对话框按钮按压与弹簧缩放
     float dialogPress_[2] = {0.0f, 0.0f};
     float dialogPressVel_[2] = {0.0f, 0.0f};
     int dialogDown_ = -1;
+    float dialogScale_ = 1.0f;
+    float dialogScaleVel_ = 0.0f;
 
     // 控制中心：展开进度（1 = 展开）
     float ccProgress_ = 1.0f;

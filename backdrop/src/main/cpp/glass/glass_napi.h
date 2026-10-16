@@ -28,6 +28,9 @@ napi_value SetDebugMode(napi_env env, napi_callback_info info);
 /** 暂停/恢复绘制（页面不可见时调用，省电）。 */
 napi_value SetPaused(napi_env env, napi_callback_info info);
 
+/** 设置系统深浅色模式（true=深色模式，false=浅色模式）。 */
+napi_value SetDarkMode(napi_env env, napi_callback_info info);
+
 /** 传照片背景的裸 RGBA（前 8 字节 = u32 LE 宽、高）。 */
 napi_value SetPhoto(napi_env env, napi_callback_info info);
 

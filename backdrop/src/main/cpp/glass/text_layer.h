@@ -73,6 +73,12 @@ float MeasureTextWidth(const std::string &text, float fontSizePx, bool bold);
 bool RenderTextOverlay(int width, int height, const std::vector<TextRun> &runs, LabelBitmap &out);
 
 /**
+ * 专用于按钮等单行文本的精准居中绘制（水平与垂直双向像素级视觉居中）。
+ */
+bool RenderCenteredText(int width, int height, const std::string &text, float fontSizePx,
+                       uint32_t argb, bool bold, LabelBitmap &out);
+
+/**
  * 把一条 24×24 视口的 SVG path（只含绝对 M/L/Q/Z）栅格化成正方形图标位图。
  *
  * 用途：控制中心的飞机图标等（参考实现里是 ImageVector，这里等价成同视口的 path）。

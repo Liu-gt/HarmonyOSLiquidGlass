@@ -32,6 +32,9 @@ export const GlassGLSetDebugMode: (mode: number) => void
  */
 export const GlassGLSetPaused: (paused: boolean) => void
 
+/** 同步系统深浅色模式（true = 深色模式，false = 浅色模式）。 */
+export const GlassGLSetDarkMode: (dark: boolean) => void
+
 /** 传入自定义背景 RGBA 数据（前 8 字节为 u32 LE 宽、高元数据）。 */
 export const GlassGLSetPhoto: (data: ArrayBuffer) => void
 

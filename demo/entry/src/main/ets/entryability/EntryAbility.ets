@@ -1,17 +1,33 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import { GlassGLSetDarkMode } from 'backdrop';
 
 const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
+  private syncColorMode(colorMode: ConfigurationConstant.ColorMode | undefined): void {
+    const isDark: boolean = colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    AppStorage.setOrCreate('isDarkMode', isDark);
+    if (GlassGLSetDarkMode !== undefined) {
+      GlassGLSetDarkMode(isDark);
+    }
+    hilog.info(DOMAIN, 'testTag', 'syncColorMode colorMode=%{public}d isDark=%{public}s',
+      colorMode ?? -1, isDark ? 'true' : 'false');
+  }
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
     }
+    this.syncColorMode(this.context.config.colorMode);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+  }
+
+  onConfigurationUpdate(newConfig: Configuration): void {
+    this.syncColorMode(newConfig.colorMode);
   }
 
   onDestroy(): void {

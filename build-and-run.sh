@@ -21,8 +21,8 @@ DEVECO="${DEVECO:-/Applications/DevEco-Studio.app/Contents}"
 TOOLCHAINS="$DEVECO/sdk/default/openharmony/toolchains"
 BUNDLE="com.example.liquidglass"
 
-# 多台设备时用 HDC_TARGET 指定，例如 HDC_TARGET=192.168.1.10:5555
-HDC_TARGET="${HDC_TARGET:-}"
+# 默认指定 Mate 80 设备（192.168.31.228:40799）
+HDC_TARGET="${HDC_TARGET:-192.168.31.228:40799}"
 if [[ -n "$HDC_TARGET" ]]; then
   hdc() { command hdc -t "$HDC_TARGET" "$@"; }
 fi

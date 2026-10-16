@@ -207,15 +207,13 @@ float MeasureWithFont(OH_Drawing_Font *font, const std::string &text) {
     return width;
 }
 
-/** 基线以上的高度（ascent）；native_drawing 返回正数，异常时按 0.88 × 字号兜底。 */
+/** 基线以上的高度（ascent）；native_drawing 中 metrics.ascent 为负，取正后返回；异常时按 0.78 × 字号兜底。 */
 float AscentOf(OH_Drawing_Font *font, float fontSizePx) {
     OH_Drawing_Font_Metrics metrics{};
-    float ascent = OH_Drawing_FontGetMetrics(font, &metrics);
-    if (ascent == 0.0f) {
-        ascent = fontSizePx * 0.88f;
-    }
-    if (ascent < 0.0f) {
-        ascent = -ascent;
+    OH_Drawing_FontGetMetrics(font, &metrics);
+    float ascent = -metrics.ascent;
+    if (ascent <= 0.0f) {
+        ascent = fontSizePx * 0.78f;
     }
     return ascent;
 }
@@ -375,6 +373,81 @@ bool RenderTextOverlay(int width, int height, const std::vector<TextRun> &runs, 
     OH_Drawing_CanvasDestroy(canvas);
     OH_Drawing_BitmapDestroy(bitmap);
     return !out.pixels.empty();
+}
+
+bool RenderCenteredText(int width, int height, const std::string &text, float fontSizePx,
+                       uint32_t argb, bool bold, LabelBitmap &out) {
+    if (width <= 0 || height <= 0 || text.empty()) {
+        return false;
+    }
+
+    OH_Drawing_Bitmap *bitmap = OH_Drawing_BitmapCreate();
+    OH_Drawing_BitmapFormat format{COLOR_FORMAT_RGBA_8888, ALPHA_FORMAT_PREMUL};
+    OH_Drawing_BitmapBuild(bitmap, static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+                           &format);
+
+    OH_Drawing_Canvas *canvas = OH_Drawing_CanvasCreate();
+    OH_Drawing_CanvasBind(canvas, bitmap);
+    OH_Drawing_CanvasClear(canvas, 0x00000000);
+
+    OH_Drawing_Brush *brush = OH_Drawing_BrushCreate();
+    OH_Drawing_BrushSetAntiAlias(brush, true);
+    OH_Drawing_BrushSetColor(brush, argb);
+    OH_Drawing_CanvasAttachBrush(canvas, brush);
+
+    OH_Drawing_Font *font = CreateFont(fontSizePx, bold);
+    OH_Drawing_Font_Metrics metrics{};
+    OH_Drawing_FontGetMetrics(font, &metrics);
+
+    float ascent = metrics.ascent;
+    float descent = metrics.descent;
+    if (ascent == 0.0f) {
+        ascent = -fontSizePx * 0.78f;
+    }
+    if (descent == 0.0f) {
+        descent = fontSizePx * 0.22f;
+    }
+
+    float visualCenterOffset = 0.0f;
+    if (metrics.capHeight < -1.0f) {
+        visualCenterOffset = (metrics.capHeight * 0.5f + (ascent + descent) * 0.5f) * 0.5f;
+    } else {
+        visualCenterOffset = (ascent + descent) * 0.5f;
+    }
+
+    float baseline = static_cast<float>(height) * 0.5f - visualCenterOffset;
+
+    float textWidth = 0.0f;
+    OH_Drawing_FontMeasureText(font, text.c_str(), text.size(), TEXT_ENCODING_UTF8, nullptr,
+                               &textWidth);
+    float x = (static_cast<float>(width) - textWidth) * 0.5f;
+
+    OH_Drawing_TextBlob *blob =
+        OH_Drawing_TextBlobCreateFromString(text.c_str(), font, TEXT_ENCODING_UTF8);
+    if (blob != nullptr) {
+        OH_Drawing_CanvasDrawTextBlob(canvas, blob, x, baseline);
+        OH_Drawing_TextBlobDestroy(blob);
+    }
+
+    OH_Drawing_CanvasDetachBrush(canvas);
+    OH_Drawing_BrushDestroy(brush);
+    OH_Drawing_FontDestroy(font);
+
+    auto *pixels = static_cast<uint32_t *>(OH_Drawing_BitmapGetPixels(bitmap));
+    if (pixels == nullptr) {
+        GERR("RenderCenteredText: BitmapGetPixels returned null");
+        OH_Drawing_CanvasDestroy(canvas);
+        OH_Drawing_BitmapDestroy(bitmap);
+        return false;
+    }
+
+    out.width = width;
+    out.height = height;
+    out.pixels.assign(pixels, pixels + static_cast<size_t>(width) * height);
+
+    OH_Drawing_CanvasDestroy(canvas);
+    OH_Drawing_BitmapDestroy(bitmap);
+    return true;
 }
 
 bool RenderIconPath(const std::string &svgPath, float viewport, int sizePx, uint32_t argb,
