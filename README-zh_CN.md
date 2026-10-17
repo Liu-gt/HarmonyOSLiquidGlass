@@ -146,7 +146,7 @@ DevEco Studio：
 ## 实现说明
 
 - 渲染器运行在独立线程，通过 EGL 上下文绘制到 XComponent 的 Surface。
-- 帧率与空闲调度：`eglSwapBuffers` 在 XComponent Surface 上不一定受 VSync 阻塞（部分机型或窗口模式下可能突破垂直同步限制导致过高帧率），因此渲染循环内置了帧率调度机制（`PaceFrame`：交互期间目标 120fps/8ms，非交互期间目标 60fps/16ms）及空闲检测机制：在无输入事件（触摸、参数修改、场景切换、尺寸改变、纹理更新）且物理弹簧累积位移低于阈值时跳过重绘，Surface 维持当前帧。位移量由所有弹簧步进统一累加（`gSpringMotion`），确保物理过渡动画平滑执行完毕。
+- 帧率与空闲调度：`eglSwapBuffers` 在 XComponent Surface 上不一定受 VSync 阻塞（部分机型或窗口模式下可能突破垂直同步限制导致过高帧率），因此渲染循环内置了帧率调度机制及空闲检测机制。帧率调度对齐 `OH_NativeVSync`（`WaitForRenderSlot`）：每个 VSync 周期最多出一帧，出帧点在 VSync 之后 0.4 个周期（夹在 1.5~4ms，让本周期的触摸与内容帧先到齐），交互期间每个 VSync 都出帧（120fps），非交互期间帧间隔取最接近 16ms 的 VSync 整数倍（120Hz 屏隔一个 VSync 出一帧，约 60fps）；交换前设置期望上屏时间（`SET_DESIRED_PRESENT_TIMESTAMP`），RenderService 只取最新一帧，避免队列积压造成的额外一帧延迟。VSync 不可用时退回定时节拍（`PaceFrame`：8ms / 16ms）。空闲检测机制：在无输入事件（触摸、参数修改、场景切换、尺寸改变、纹理更新）且物理弹簧累积位移低于阈值时跳过重绘，Surface 维持当前帧。位移量由所有弹簧步进统一累加（`gSpringMotion`）并按速率判定（与单轮步长无关）；判定停止时页签弹簧须已贴近目标才对齐到目标值，确保物理过渡动画平滑执行完毕、静止画面与帧时序无关。
 - ArkTS 内容纹理管线：渲染线程创建 `OH_NativeImage` 并将 Surface ID 传递至 ArkTS 层；`BuilderNode(RENDER_TYPE_TEXTURE)` 将 ArkUI 组件树离屏渲染至该 Surface。渲染线程在 VSync 信号到达时获取最新图像帧（`OH_NativeImage_UpdateSurfaceImage`），随后 Blit 为标准 2D 纹理以适配材质着色器的 `sampler2D` 采样要求。针对外部纹理直接采样的垂直镜像问题，结合 `OH_NativeImage` 的变换矩阵进行坐标校正。
 - `photo.rgba` 是无压缩 RGBA 缓冲，前缀 8 字节为 `u32` LE 宽、`u32` LE 高，内容为 Kyant demo 的壁纸（`wallpaper_light.webp`）。可用 `python3 demo/tools/make-photo-raw.py <图片> [宽度]` 从任意图片重新生成。
 - 源码注释中的“参考实现”指本效果所对齐的 Compose Multiplatform 版本；本仓库是对应的独立 GLES 重实现。

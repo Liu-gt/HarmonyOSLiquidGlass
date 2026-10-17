@@ -29,3 +29,5 @@ target_link_libraries(backdrop PUBLIC ${EGL-lib} ${GLES-lib} libc++_shared.so)
 target_link_libraries(backdrop PUBLIC libace_ndk.z.so libnative_window.so libnative_drawing.so)
 # OH_NativeImage：BuilderNode 纹理导出（RENDER_TYPE_TEXTURE）的接收端
 target_link_libraries(backdrop PUBLIC libnative_image.so)
+# OH_NativeVSync：出帧对齐 vsync（每周期最多一帧，见 GlesRenderer::WaitForRenderSlot）
+target_link_libraries(backdrop PUBLIC libnative_vsync.so)

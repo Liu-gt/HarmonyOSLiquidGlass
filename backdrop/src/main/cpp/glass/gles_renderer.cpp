@@ -2,12 +2,14 @@
 
 #include <GLES2/gl2ext.h>   // GL_TEXTURE_EXTERNAL_OES（OH_NativeImage 的外纹理）
 #include <hilog/log.h>
+#include <native_window/external_window.h>
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "glass_params.h"
@@ -338,11 +340,10 @@ void main() {
     vec2 samplePx = uSamplePivot + (px - uSamplePivot) / uSampleScale;
     vec2 sampleUv = samplePx / uResolution;
 
-    vec3 sharp = texture(uBackdrop, sampleUv).rgb;
-    vec3 blurred = texture(uBlurred, sampleUv).rgb;
-
     float radius = radiusAt(centeredCoord, uRadii);
     float sd = sdRoundedRectG2(centeredCoord, halfSize, radius, uG2Factor);
+    // 抗锯齿宽度：屏幕空间导数必须在任何分支之前算（下面的形状外提前退出是非一致控制流）
+    float aa = max(fwidth(sd), 0.75);
 
     // ---- 形状外：清晰背景 + 外投影 ----
     // 对齐上游 Shadow 默认值：radius 24dp（模糊半径）、offset.y = radius/6、颜色黑 alpha 0.1。
@@ -352,6 +353,27 @@ void main() {
     //    等于把整屏形状外**均匀压暗 10%**，根本没有随距离衰减。
     float sdShadow = sdRoundedRectG2(centeredCoord + vec2(0.0, uShadowOffset), halfSize, radius, uG2Factor);
     float shade = 1.0 - smoothstep(0.0, max(uShadowBlur, 1.0), sdShadow);
+
+    // ---- 形状外提前退出（性能）----
+    // 形状外像素的输出只取决于投影（叠加模式）或清晰背景 + 投影（直写模式），下面整套材质
+    // （折射 / 色散 / 高光 / 文字）对它们的结果会被覆盖率丢掉 —— 全屏三角形下这部分占了
+    // 大多数像素。提前输出与原式逐像素相同（直写模式同样叠 ditherNoise）。
+    if (uOverlayMode > 0.5) {
+        if (sd > 0.0) {
+            float shAlphaOut = (1.0 - smoothstep(0.0, max(uShadowBlur, 1.0), sdShadow)) *
+                               uShadowAlpha * uShadow;
+            outColor = vec4(vec3(0.0), shAlphaOut * uEffectOpacity);
+            return;
+        }
+    } else if (sd >= aa) {
+        vec3 sharpOut = texture(uBackdrop, sampleUv).rgb;
+        outColor = vec4(sharpOut * (1.0 - shade * uShadowAlpha * uShadow) +
+                        ditherNoise(gl_FragCoord.xy), 1.0);
+        return;
+    }
+
+    vec3 sharp = texture(uBackdrop, sampleUv).rgb;
+    vec3 blurred = texture(uBlurred, sampleUv).rgb;
     vec3 outsideCol = sharp * (1.0 - shade * uShadowAlpha * uShadow);
 
     // ---- 形状内 ----
@@ -454,11 +476,14 @@ void main() {
         // 不做描边环。默认 alpha 仍走 uHighlight。
         result += vec3(uHighlight);
     } else {
-        float gradRadius = min(radius, min(halfSize.x, halfSize.y));
-        vec2 nrm = gradSdRoundedRectG2(centeredCoord, halfSize, gradRadius, uG2Factor);
-        dl = dot(nrm, vec2(0.70710678, 0.70710678));
+        // 环外 ring = 0：高光与下面的环境光都为 0，法线（4 次 SDF）只在环内算
         float ring = 1.0 - smoothstep(uHighlightWidth, uHighlightWidth + uHighlightBlur, edge);
-        result += vec3(abs(dl) * uHighlight * ring);
+        if (ring > 0.0) {
+            float gradRadius = min(radius, min(halfSize.x, halfSize.y));
+            vec2 nrm = gradSdRoundedRectG2(centeredCoord, halfSize, gradRadius, uG2Factor);
+            dl = dot(nrm, vec2(0.70710678, 0.70710678));
+            result += vec3(abs(dl) * uHighlight * ring);
+        }
     }
 
     // ---- 环境光（对照上游 AmbientHighlightShaderString）----
@@ -483,8 +508,7 @@ void main() {
         result = mix(result, label.rgb, label.a);
     }
 
-    // ---- 抗锯齿：屏幕空间导数得到约 1 物理像素的覆盖率过渡 ----
-    float aa = max(fwidth(sd), 0.75);
+    // ---- 抗锯齿：屏幕空间导数得到约 1 物理像素的覆盖率过渡（aa 已在开头算好）----
     float coverage = 1.0 - smoothstep(-aa, aa, sd);
 
     if (uOverlayMode > 0.5) {
@@ -606,6 +630,8 @@ void main() {
     // 圆角半径跟纵向缩放（半径 = 半高，纵向一撑就还是胶囊端头）。
     float radius = radiusAt(centeredCoord, uRadii) * uShapeScaleY;
     float sd = sdRoundedRect(centeredCoord, halfSize, radius);
+    // 抗锯齿宽度：导数必须在分支之前算（下面的胶囊外提前退出是非一致控制流）
+    float aa = max(fwidth(sd), 0.75);
 
     // 指示器投影：鼓出底座时靠它和底座边框"断开"，做出 iOS 那种空隙/分离感。
     // 外投影纵向渐变：按压时中线以上不投影、往下越散、两侧收窄到 35%，影子只落在轮廓下方。
@@ -613,7 +639,9 @@ void main() {
                                    halfSize, radius);
     float shadowBlurV = uShadowBlur;
     float shadowAlphaV = uShadowAlpha;
-    if (uShadowSpreadV > 0.001) {
+    // 纵向渐变只会把模糊半径往小收（grow ≤ 1）：投影范围外（sdShadow ≥ 原半径）shade 恒为 0，
+    // 不必为它算梯度（4 次 SDF；按压态下这一项原先每个像素都算）
+    if (uShadowSpreadV > 0.001 && sdShadow < max(uShadowBlur, 1.0)) {
         float tV = (halfSize.y - centeredCoord.y) / max(2.0 * halfSize.y, 1e-4);
         float bottomT = clamp((tV - 0.5) / 0.5, 0.0, 1.0);
         vec2 gS = gradSdRoundedRect(centeredCoord + vec2(0.0, uShadowOffset), halfSize, radius);
@@ -630,6 +658,15 @@ void main() {
         outsideScene = overLabels(outsideScene, texture(uLabels, labelUv(labelLocalAt(px))));
     }
     vec3 outsideCol = outsideScene * (1.0 - shade * shadowAlphaV);
+
+    // ---- 胶囊外提前退出（性能）----
+    // 覆盖率为 0（sd ≥ aa）的像素只输出上面的"场景 + 常态文字 + 指示器投影"，
+    // 透镜采样（按压态每像素多组色散采样）与高光全是会被覆盖率丢掉的计算 ——
+    // 写屏 pass 是全屏三角形，胶囊外占绝大多数像素。提前输出与原式逐像素相同。
+    if (sd >= aa) {
+        outColor = vec4(outsideCol, 1.0);
+        return;
+    }
 
     float edge = max(0.0, -sd);
     // 透镜采样点：绕中心按 uPressScale 缩放后取场景（<1 = 内容缩微）。
@@ -717,11 +754,14 @@ void main() {
     // `1 - smoothstep(环宽, 环宽+柔化, edge)`。（法线已用中央差分，本身平滑，
     // 不再需要那层遮罩压楔形。）
     {
-        float gradRadius = min(radius * 1.5, min(halfSize.x, halfSize.y));
-        vec2 nrm = gradSdRoundedRect(centeredCoord, halfSize, gradRadius);
-        float dl = dot(nrm, vec2(0.70710678, 0.70710678));
+        // 环外 ring = 0：法线（4 次 SDF）只在高光环内算
         float ring = 1.0 - smoothstep(uHighlightWidth, uHighlightWidth + uHighlightBlur, edge);
-        result += vec3(abs(dl) * uHighlight * ring);
+        if (ring > 0.0 && uHighlight > 0.0) {
+            float gradRadius = min(radius * 1.5, min(halfSize.x, halfSize.y));
+            vec2 nrm = gradSdRoundedRect(centeredCoord, halfSize, gradRadius);
+            float dl = dot(nrm, vec2(0.70710678, 0.70710678));
+            result += vec3(abs(dl) * uHighlight * ring);
+        }
     }
 
     // ---- 外缘细灰线（HallPass）----
@@ -733,8 +773,7 @@ void main() {
         result = mix(result, vec3(0.72, 0.73, 0.75), line * uEdgeLine);
     }
 
-    // ---- 抗锯齿（同底板）----
-    float aa = max(fwidth(sd), 0.75);
+    // ---- 抗锯齿（同底板；aa 已在开头算好）----
     float coverage = 1.0 - smoothstep(-aa, aa, sd);
     outColor = vec4(mix(outsideCol, result, coverage), 1.0);
 }
@@ -944,6 +983,12 @@ int64_t NowMs() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+/** CLOCK_MONOTONIC 纳秒（与 OH_NativeVSync 回调的时间戳同一时钟，即 std::chrono::steady_clock）。 */
+int64_t MonoNs() {
+    using namespace std::chrono;
+    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 void SetupTexture(GLuint tex) {
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1046,8 +1091,29 @@ float gSpringMotion = 0.0f;
 constexpr int64_t kInteractiveFrameMs = 8;
 constexpr int64_t kNormalFrameMs = 16;
 constexpr int64_t kInteractiveWindowMs = 400;
-// 弹簧位移累积低于此值就认为动画停了（单位：值/帧，1e-3 已经远低于可见阈值）。
-constexpr float kIdleMotionEps = 1e-3f;
+// 弹簧"还在动"的判据：本轮所有弹簧位移之和换算成**速率**（值/秒）超过它。按速率判、与本轮
+// 步长无关 —— vsync 调度下每出一帧循环要醒 2~3 次（等 vsync / 等相位），单轮步长只有 ~3ms，
+// 按"每轮位移 > 1e-3"判的话，页签弹簧离目标还差好几个像素就判停（落定对齐就是一跳）。
+// 取值 = 旧口径"16ms 一帧位移 1e-3"。
+constexpr float kIdleMotionRate = 0.06f;
+// 弹簧单步的最长步长（UpdateAnim 的夹取），换算速率用同一个值
+constexpr float kMaxSpringStepSec = 0.05f;
+// 落定对齐的位置容差（见 SettleTabSprings）：几何量（页签位置 / 缩放 / 速度形变）与强度量
+// （按压进度 / 光斑 / 按钮按压）。
+constexpr float kSettleGeometryTolerance = 0.002f;
+constexpr float kSettleLevelTolerance = 0.01f;
+
+// vsync 对齐出帧（见 GlesRenderer::WaitForRenderSlot）：出帧点 = vsync + 0.4 周期（夹在 1.5~4ms），
+// 离下个 vsync 不足 2.5ms 就顺延：一帧录制 + 交换约 1.5~2.5ms（SURFACE 的取 / 交 buffer 走 IPC），
+// 赶不上 RenderService 在下个 vsync 的取走，画了也只会和下一帧一起上屏。
+constexpr int64_t kRenderPhaseMinNs = 1500000;
+constexpr int64_t kRenderPhaseMaxNs = 4000000;
+constexpr int64_t kRenderLateMarginNs = 2500000;
+
+// 持有 vsync 连接的渲染器（OnVsyncCallback 只在登记表里还有它时才碰它）：渲染器销毁后
+// 迟到的 vsync 回调不能再访问它。
+std::mutex gVsyncOwnersMutex;
+std::unordered_set<const void *> gVsyncOwners;
 
 /**
  * 半隐式欧拉步进一个弹簧（本文件所有弹簧共用同一套公式：c = 2√k × ratio）。
@@ -1118,7 +1184,12 @@ void GlesRenderer::OnSurfaceChanged(uint64_t width, uint64_t height) {
 
 void GlesRenderer::OnSurfaceDestroyed() {
     if (thread_.joinable()) {
-        stopRequested_.store(true);
+        {
+            // 置位放在节拍等待的互斥量下再叫醒（不丢唤醒）：渲染线程可能正等在 vsync / 出帧点上
+            std::lock_guard<std::mutex> lock(vsyncWaitMutex_);
+            stopRequested_.store(true);
+        }
+        vsyncWaitCv_.notify_all();
         thread_.join();
     }
     running_.store(false);
@@ -1216,6 +1287,124 @@ void GlesRenderer::PaceFrame() {
         }
     }
     lastDrawMs_ = NowMs();   // 用睡醒后的真实时刻，避免误差累积
+}
+
+GLint GlesRenderer::Uniform(GLuint program, const char *name) {
+    const UniformKey key{program, name};
+    const auto it = uniformCache_.find(key);
+    if (it != uniformCache_.end()) {
+        return it->second;
+    }
+    const GLint location = glGetUniformLocation(program, name);
+    uniformCache_.emplace(key, location);
+    return location;
+}
+
+void GlesRenderer::CreateVsync() {
+    if (vsync_ != nullptr) {
+        return;
+    }
+    const char name[] = "glass_vsync";
+    vsyncNs_.store(0);
+    vsyncPeriodNs_.store(0);
+    lastRenderVsyncNs_ = -1;
+    periodQueriedVsyncNs_ = -1;
+    {
+        std::lock_guard<std::mutex> lock(gVsyncOwnersMutex);
+        gVsyncOwners.insert(this);
+    }
+    vsync_ = OH_NativeVSync_Create(name, static_cast<unsigned int>(sizeof(name) - 1));
+    if (vsync_ == nullptr) {
+        GERR("OH_NativeVSync_Create failed: fall back to timer pacing");
+    }
+}
+
+void GlesRenderer::DestroyVsync() {
+    {
+        // 先注销：此后到达的回调一律不碰本对象
+        std::lock_guard<std::mutex> lock(gVsyncOwnersMutex);
+        gVsyncOwners.erase(this);
+    }
+    if (vsync_ != nullptr) {
+        OH_NativeVSync_Destroy(vsync_);
+        vsync_ = nullptr;
+    }
+}
+
+void GlesRenderer::RequestVsync() {
+    if (vsync_ != nullptr) {
+        OH_NativeVSync_RequestFrame(vsync_, &GlesRenderer::OnVsyncCallback, this);
+    }
+}
+
+void GlesRenderer::OnVsyncCallback(long long timestamp, void *data) {
+    // vsync 线程：只记时间戳并叫醒渲染线程。持锁访问：渲染器注销（DestroyVsync）之后的
+    // 迟到回调直接丢弃。周期由渲染线程查询。
+    std::lock_guard<std::mutex> lock(gVsyncOwnersMutex);
+    if (data == nullptr || gVsyncOwners.count(data) == 0) {
+        return;
+    }
+    auto *self = static_cast<GlesRenderer *>(data);
+    {
+        // 置位放在等待方的互斥量下：等待方在锁里判谓词再挂起，置位若落在"谓词已判 false、
+        // 尚未挂起"之间，这次唤醒就丢了（要等到超时）
+        std::lock_guard<std::mutex> waitLock(self->vsyncWaitMutex_);
+        self->vsyncNs_.store(timestamp);
+    }
+    self->vsyncWaitCv_.notify_all();
+}
+
+bool GlesRenderer::WaitForRenderSlot(bool fast) {
+    if (vsync_ == nullptr) {
+        PaceFrame();   // 没有 vsync：退回原来的时间节拍（交互 8ms / 其余 16ms）
+        return true;
+    }
+    const int64_t vs = vsyncNs_.load();
+    if (vs > 0 && vs != periodQueriedVsyncNs_) {
+        // 周期只在拿到新回调后才会刷新（LTPO 会在 120/90/60Hz 间切换），渲染线程自己查
+        periodQueriedVsyncNs_ = vs;
+        long long periodNs = 0;
+        if (OH_NativeVSync_GetPeriod(vsync_, &periodNs) == 0 && periodNs > 0) {
+            vsyncPeriodNs_.store(periodNs);
+        }
+    }
+    const int64_t period = vsyncPeriodNs_.load();
+    const int64_t now = MonoNs();
+    if (!vsyncClockLogged_ && vs > 0) {
+        vsyncClockLogged_ = true;
+        GLOG("vsync: period=%{public}lldns now-vsync=%{public}lldus",
+             static_cast<long long>(period), static_cast<long long>((now - vs) / 1000));
+    }
+    if (period <= 0 || vs <= 0 || now - vs > 2 * period) {
+        // vsync 信息不新鲜（刚起步 / 空闲后的第一帧）：直接画，同时请求 vsync 把节拍接上
+        RequestVsync();
+        return true;
+    }
+    const int64_t phase = std::max(kRenderPhaseMinNs, std::min(kRenderPhaseMaxNs, period * 2 / 5));
+    // 非交互（松手 400ms 后的弹簧尾段 / 内容帧）沿用原来 ~60fps 的档位：离上一帧不足 16ms 的 vsync
+    // 跳过（减半个周期吸收时间戳抖动：120Hz 隔一个出一帧，60Hz 每个都出）。交互中每个 vsync 都出。
+    const int64_t minGapNs = fast ? 1 : kNormalFrameMs * 1000000 - period / 2;
+    const bool used = lastRenderVsyncNs_ >= 0 && vs - lastRenderVsyncNs_ < minGapNs;
+    const bool late = now - vs > period - kRenderLateMarginNs;
+    if (!used && !late) {
+        const int64_t target = vs + phase;
+        if (now >= target) {
+            return true;
+        }
+        // 等到 vsync + δ：本周期的触摸 / 内容帧在这之前陆续到齐，到点用最新的输入画
+        std::unique_lock<std::mutex> lock(vsyncWaitMutex_);
+        vsyncWaitCv_.wait_for(lock, std::chrono::nanoseconds(target - now),
+                              [this] { return stopRequested_.load(); });
+        return false;
+    }
+    // 本周期不出帧 / 来不及赶上这次取走：等下一个 vsync（回调会换掉 vsyncNs_）。
+    // 预约放在锁外：回调也要拿这把锁。
+    RequestVsync();
+    std::unique_lock<std::mutex> lock(vsyncWaitMutex_);
+    vsyncWaitCv_.wait_for(lock, std::chrono::nanoseconds(2 * period), [this, vs] {
+        return vsyncNs_.load() != vs || stopRequested_.load();
+    });
+    return false;
 }
 
 void GlesRenderer::SetScene(int scene) {
@@ -1494,6 +1683,54 @@ void GlesRenderer::UpdateAnim(float dt) {
         if (btnPress_[i] < 0.0f) { btnPress_[i] = 0.0f; btnPressVelocity_[i] = 0.0f; }
         if (btnPress_[i] > 1.0f) { btnPress_[i] = 1.0f; btnPressVelocity_[i] = 0.0f; }
     }
+}
+
+GlesRenderer::SpringSettle GlesRenderer::SettleTabSprings() {
+    std::lock_guard<std::mutex> lock(animMutex_);
+    const bool dragging = anim_.dragging;
+    const float valueTarget = dragging ? anim_.targetValue : static_cast<float>(anim_.targetIndex);
+    const float pressTarget = dragging ? 1.0f : 0.0f;
+    const float scaleXTarget = dragging ? params_.N(pid::kPressedScaleX) : 1.0f;
+    const float scaleYTarget = dragging ? params_.N(pid::kPressedScale) : 1.0f;
+    const auto near = [](float value, float target, float tolerance) {
+        return std::fabs(value - target) <= tolerance;
+    };
+    // 先确认每根弹簧都贴着目标：欠阻尼弹簧（缩放 / 光斑）在折返点速度过零，速率判据会在那里
+    // 误判"停了"，这时离目标可能还差好几个像素，对齐就是一跳 —— 返回 kFar，循环当它还在动。
+    bool allNear = near(anim_.value, valueTarget, kSettleGeometryTolerance) &&
+                   near(anim_.scaleX, scaleXTarget, kSettleGeometryTolerance) &&
+                   near(anim_.scaleY, scaleYTarget, kSettleGeometryTolerance) &&
+                   // 拖动中速度目标跟手指走，不参与
+                   (dragging || near(anim_.speed, 0.0f, kSettleGeometryTolerance)) &&
+                   near(anim_.press, pressTarget, kSettleLevelTolerance) &&
+                   near(glowPress_, pressTarget, kSettleLevelTolerance);
+    for (int i = 0; i < kIconButtonCount; i++) {
+        allNear = allNear &&
+                  near(btnPress_[i], (btnDownIndex_ == i) ? 1.0f : 0.0f, kSettleLevelTolerance);
+    }
+    if (!allNear) {
+        return SpringSettle::kFar;
+    }
+    bool changed = false;
+    const auto snap = [&changed](float &value, float &velocity, float target) {
+        if (std::fabs(value - target) > 1e-6f) {
+            changed = true;
+        }
+        value = target;
+        velocity = 0.0f;
+    };
+    snap(anim_.value, anim_.valueVelocity, valueTarget);
+    if (!dragging) {
+        snap(anim_.speed, anim_.speedVelocity, 0.0f);
+    }
+    snap(anim_.press, anim_.pressVelocity, pressTarget);
+    snap(anim_.scaleX, anim_.scaleXVelocity, scaleXTarget);
+    snap(anim_.scaleY, anim_.scaleYVelocity, scaleYTarget);
+    snap(glowPress_, glowPressVelocity_, pressTarget);
+    for (int i = 0; i < kIconButtonCount; i++) {
+        snap(btnPress_[i], btnPressVelocity_[i], (btnDownIndex_ == i) ? 1.0f : 0.0f);
+    }
+    return changed ? SpringSettle::kSnapped : SpringSettle::kExact;
 }
 
 // ===========================================================================
@@ -2521,8 +2758,8 @@ bool GlesRenderer::UpdateContentTexture(int w, int h) {
     glUseProgram(progExtCopy_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, contentTex_);
-    glUniform1i(glGetUniformLocation(progExtCopy_, "uExternal"), 0);
-    glUniformMatrix4fv(glGetUniformLocation(progExtCopy_, "uTexMatrix"), 1, GL_FALSE,
+    glUniform1i(Uniform(progExtCopy_, "uExternal"), 0);
+    glUniformMatrix4fv(Uniform(progExtCopy_, "uTexMatrix"), 1, GL_FALSE,
                        contentMatrix_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
@@ -2531,6 +2768,7 @@ bool GlesRenderer::UpdateContentTexture(int w, int h) {
 }
 
 void GlesRenderer::DestroyGl() {
+    uniformCache_.clear();   // 程序名会被复用：缓存随程序一起作废
     if (bgFbo_ != 0) { glDeleteFramebuffers(1, &bgFbo_); bgFbo_ = 0; }
     if (bgTex_ != 0) { glDeleteTextures(1, &bgTex_); bgTex_ = 0; }
     if (blurFbo_[0] != 0) { glDeleteFramebuffers(2, blurFbo_); blurFbo_[0] = 0; }
@@ -2804,12 +3042,12 @@ GLuint GlesRenderer::BlurIterations(GLuint sourceTex, float sigmaPx, int w, int 
             glUseProgram(progBlur_);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, src);
-            glUniform1i(glGetUniformLocation(progBlur_, "uSource"), 0);
-            glUniform2f(glGetUniformLocation(progBlur_, "uTexel"), 1.0f / static_cast<float>(w),
+            glUniform1i(Uniform(progBlur_, "uSource"), 0);
+            glUniform2f(Uniform(progBlur_, "uTexel"), 1.0f / static_cast<float>(w),
                         1.0f / static_cast<float>(h));
-            glUniform2f(glGetUniformLocation(progBlur_, "uDir"), axis == 0 ? 1.0f : 0.0f,
+            glUniform2f(Uniform(progBlur_, "uDir"), axis == 0 ? 1.0f : 0.0f,
                         axis == 0 ? 0.0f : 1.0f);
-            glUniform1f(glGetUniformLocation(progBlur_, "uRadius"), step);
+            glUniform1f(Uniform(progBlur_, "uRadius"), step);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             src = dst;
         }
@@ -2873,11 +3111,11 @@ GLuint GlesRenderer::RenderBlur(GLuint sourceTex, float radiusPx) {
             glUseProgram(progBlur_);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, src);
-            glUniform1i(glGetUniformLocation(progBlur_, "uSource"), 0);
-            glUniform2f(glGetUniformLocation(progBlur_, "uTexel"),
+            glUniform1i(Uniform(progBlur_, "uSource"), 0);
+            glUniform2f(Uniform(progBlur_, "uTexel"),
                         1.0f / static_cast<float>(srcW), 1.0f / static_cast<float>(srcH));
-            glUniform2f(glGetUniformLocation(progBlur_, "uDir"), 1.0f, 0.0f);
-            glUniform1f(glGetUniformLocation(progBlur_, "uRadius"), 0.0f);
+            glUniform2f(Uniform(progBlur_, "uDir"), 1.0f, 0.0f);
+            glUniform1f(Uniform(progBlur_, "uRadius"), 0.0f);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             src = blurDownTex_[l][0];
             srcW = lw;
@@ -2906,7 +3144,7 @@ void GlesRenderer::BlitTexture(GLuint tex, int w, int h) {
     glUseProgram(progCopy_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glUniform1i(glGetUniformLocation(progCopy_, "uSource"), 0);
+    glUniform1i(Uniform(progCopy_, "uSource"), 0);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -2917,7 +3155,7 @@ void GlesRenderer::CopyBackgroundToScene(int w, int h) {
     glUseProgram(progCopy_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, bgTex_);
-    glUniform1i(glGetUniformLocation(progCopy_, "uSource"), 0);
+    glUniform1i(Uniform(progCopy_, "uSource"), 0);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -2990,11 +3228,11 @@ void GlesRenderer::DrawSolid(const SolidSpec &spec, int w, int h) {
         rBR = spec.rBR;
         rBL = spec.rBL;
     }
-    glUniform2f(glGetUniformLocation(prog, "uResolution"), static_cast<float>(w),
+    glUniform2f(Uniform(prog, "uResolution"), static_cast<float>(w),
                 static_cast<float>(h));
-    glUniform4f(glGetUniformLocation(prog, "uRect"), spec.x, spec.y, spec.w, spec.h);
-    glUniform4f(glGetUniformLocation(prog, "uRadii"), rTL, rTR, rBR, rBL);
-    glUniform4f(glGetUniformLocation(prog, "uColor"), spec.colorR, spec.colorG, spec.colorB,
+    glUniform4f(Uniform(prog, "uRect"), spec.x, spec.y, spec.w, spec.h);
+    glUniform4f(Uniform(prog, "uRadii"), rTL, rTR, rBR, rBL);
+    glUniform4f(Uniform(prog, "uColor"), spec.colorR, spec.colorG, spec.colorB,
                 spec.a);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
@@ -3010,11 +3248,11 @@ void GlesRenderer::DrawSprite(GLuint tex, float x, float y, float w, float h, in
     glUseProgram(progSprite_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glUniform1i(glGetUniformLocation(progSprite_, "uSprite"), 0);
-    glUniform2f(glGetUniformLocation(progSprite_, "uResolution"), static_cast<float>(screenW),
+    glUniform1i(Uniform(progSprite_, "uSprite"), 0);
+    glUniform2f(Uniform(progSprite_, "uResolution"), static_cast<float>(screenW),
                 static_cast<float>(screenH));
-    glUniform4f(glGetUniformLocation(progSprite_, "uRect"), x, y, w, h);
-    glUniform1f(glGetUniformLocation(progSprite_, "uAlpha"), alpha);
+    glUniform4f(Uniform(progSprite_, "uRect"), x, y, w, h);
+    glUniform1f(Uniform(progSprite_, "uAlpha"), alpha);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -3058,54 +3296,54 @@ void GlesRenderer::DrawGlass(const GlassSpec &s, GLuint targetFbo, int w, int h)
     glUseProgram(progGlass_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, backdropTex);
-    glUniform1i(glGetUniformLocation(progGlass_, "uBackdrop"), 0);
+    glUniform1i(Uniform(progGlass_, "uBackdrop"), 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, blurredTex);
-    glUniform1i(glGetUniformLocation(progGlass_, "uBlurred"), 1);
+    glUniform1i(Uniform(progGlass_, "uBlurred"), 1);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, labelTex_);
-    glUniform1i(glGetUniformLocation(progGlass_, "uLabels"), 2);
-    glUniform2f(glGetUniformLocation(progGlass_, "uLabelSize"), 1.0f, 1.0f);
-    glUniform2f(glGetUniformLocation(progGlass_, "uResolution"), static_cast<float>(w),
+    glUniform1i(Uniform(progGlass_, "uLabels"), 2);
+    glUniform2f(Uniform(progGlass_, "uLabelSize"), 1.0f, 1.0f);
+    glUniform2f(Uniform(progGlass_, "uResolution"), static_cast<float>(w),
                 static_cast<float>(h));
-    glUniform2f(glGetUniformLocation(progGlass_, "uTexel"), 1.0f / static_cast<float>(w),
+    glUniform2f(Uniform(progGlass_, "uTexel"), 1.0f / static_cast<float>(w),
                 1.0f / static_cast<float>(h));
-    glUniform4f(glGetUniformLocation(progGlass_, "uGlassRect"), s.x, s.y, s.w, s.h);
-    glUniform4f(glGetUniformLocation(progGlass_, "uRadii"), s.rTL, s.rTR, s.rBR, s.rBL);
-    glUniform1f(glGetUniformLocation(progGlass_, "uScaleX"), s.scaleX);
-    glUniform1f(glGetUniformLocation(progGlass_, "uScaleY"), s.scaleY);
-    glUniform1f(glGetUniformLocation(progGlass_, "uRefractionHeight"), s.refractionHeight);
-    glUniform1f(glGetUniformLocation(progGlass_, "uRefractionAmount"), -s.refractionAmount);
-    glUniform1f(glGetUniformLocation(progGlass_, "uDispersion"), s.dispersion ? 1.0f : 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uDepthEffect"), s.depthEffect ? 1.0f : 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uSurfaceAlpha"), s.surfaceAlpha);
-    glUniform3f(glGetUniformLocation(progGlass_, "uSurfaceColor"), s.surfaceR, s.surfaceG,
+    glUniform4f(Uniform(progGlass_, "uGlassRect"), s.x, s.y, s.w, s.h);
+    glUniform4f(Uniform(progGlass_, "uRadii"), s.rTL, s.rTR, s.rBR, s.rBL);
+    glUniform1f(Uniform(progGlass_, "uScaleX"), s.scaleX);
+    glUniform1f(Uniform(progGlass_, "uScaleY"), s.scaleY);
+    glUniform1f(Uniform(progGlass_, "uRefractionHeight"), s.refractionHeight);
+    glUniform1f(Uniform(progGlass_, "uRefractionAmount"), -s.refractionAmount);
+    glUniform1f(Uniform(progGlass_, "uDispersion"), s.dispersion ? 1.0f : 0.0f);
+    glUniform1f(Uniform(progGlass_, "uDepthEffect"), s.depthEffect ? 1.0f : 0.0f);
+    glUniform1f(Uniform(progGlass_, "uSurfaceAlpha"), s.surfaceAlpha);
+    glUniform3f(Uniform(progGlass_, "uSurfaceColor"), s.surfaceR, s.surfaceG,
                 s.surfaceB);
-    glUniform1f(glGetUniformLocation(progGlass_, "uBlurRadius"), s.blurRadiusPx);
-    glUniform1f(glGetUniformLocation(progGlass_, "uVibrancy"), s.vibrancy);
-    glUniform1f(glGetUniformLocation(progGlass_, "uBrightness"), s.brightness);
-    glUniform1f(glGetUniformLocation(progGlass_, "uContrast"), s.contrast);
-    glUniform1f(glGetUniformLocation(progGlass_, "uSaturation"), s.saturation);
-    glUniform1f(glGetUniformLocation(progGlass_, "uEffectOpacity"), s.effectOpacity);
-    glUniform1f(glGetUniformLocation(progGlass_, "uPlainHighlight"), s.plainHighlight ? 1.0f : 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uHighlight"), s.highlight);
-    glUniform1f(glGetUniformLocation(progGlass_, "uHighlightWidth"), s.highlightWidthPx);
-    glUniform1f(glGetUniformLocation(progGlass_, "uHighlightBlur"), s.highlightBlurPx);
-    glUniform1f(glGetUniformLocation(progGlass_, "uAmbient"), s.ambient ? 1.0f : 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uAmbientIntensity"), s.ambientIntensity);
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadowBlur"), s.shadowBlurPx);
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadowOffset"), s.shadowOffsetPx);
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadowAlpha"), s.shadowAlpha);
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadow"), s.hasShadow ? 1.0f : 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uInnerRadius"), s.innerRadiusPx);
-    glUniform1f(glGetUniformLocation(progGlass_, "uInnerAlpha"), s.innerAlpha);
-    glUniform2f(glGetUniformLocation(progGlass_, "uSampleScale"), s.sampleScaleX, s.sampleScaleY);
-    glUniform2f(glGetUniformLocation(progGlass_, "uSamplePivot"), s.samplePivotX, s.samplePivotY);
-    glUniform1f(glGetUniformLocation(progGlass_, "uG2Factor"), s.g2Factor);
-    glUniform1f(glGetUniformLocation(progGlass_, "uRimClarity"), s.rimClarity);
-    glUniform1f(glGetUniformLocation(progGlass_, "uBevelAlphaScale"), s.bevelAlphaScale);
-    glUniform1f(glGetUniformLocation(progGlass_, "uShowLabels"), 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uOverlayMode"), 1.0f);
+    glUniform1f(Uniform(progGlass_, "uBlurRadius"), s.blurRadiusPx);
+    glUniform1f(Uniform(progGlass_, "uVibrancy"), s.vibrancy);
+    glUniform1f(Uniform(progGlass_, "uBrightness"), s.brightness);
+    glUniform1f(Uniform(progGlass_, "uContrast"), s.contrast);
+    glUniform1f(Uniform(progGlass_, "uSaturation"), s.saturation);
+    glUniform1f(Uniform(progGlass_, "uEffectOpacity"), s.effectOpacity);
+    glUniform1f(Uniform(progGlass_, "uPlainHighlight"), s.plainHighlight ? 1.0f : 0.0f);
+    glUniform1f(Uniform(progGlass_, "uHighlight"), s.highlight);
+    glUniform1f(Uniform(progGlass_, "uHighlightWidth"), s.highlightWidthPx);
+    glUniform1f(Uniform(progGlass_, "uHighlightBlur"), s.highlightBlurPx);
+    glUniform1f(Uniform(progGlass_, "uAmbient"), s.ambient ? 1.0f : 0.0f);
+    glUniform1f(Uniform(progGlass_, "uAmbientIntensity"), s.ambientIntensity);
+    glUniform1f(Uniform(progGlass_, "uShadowBlur"), s.shadowBlurPx);
+    glUniform1f(Uniform(progGlass_, "uShadowOffset"), s.shadowOffsetPx);
+    glUniform1f(Uniform(progGlass_, "uShadowAlpha"), s.shadowAlpha);
+    glUniform1f(Uniform(progGlass_, "uShadow"), s.hasShadow ? 1.0f : 0.0f);
+    glUniform1f(Uniform(progGlass_, "uInnerRadius"), s.innerRadiusPx);
+    glUniform1f(Uniform(progGlass_, "uInnerAlpha"), s.innerAlpha);
+    glUniform2f(Uniform(progGlass_, "uSampleScale"), s.sampleScaleX, s.sampleScaleY);
+    glUniform2f(Uniform(progGlass_, "uSamplePivot"), s.samplePivotX, s.samplePivotY);
+    glUniform1f(Uniform(progGlass_, "uG2Factor"), s.g2Factor);
+    glUniform1f(Uniform(progGlass_, "uRimClarity"), s.rimClarity);
+    glUniform1f(Uniform(progGlass_, "uBevelAlphaScale"), s.bevelAlphaScale);
+    glUniform1f(Uniform(progGlass_, "uShowLabels"), 0.0f);
+    glUniform1f(Uniform(progGlass_, "uOverlayMode"), 1.0f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
@@ -3999,15 +4237,15 @@ void GlesRenderer::DrawProgressiveBlurScene(int w, int h) {
     glUseProgram(progProgBlur_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, bgTex_);
-    glUniform1i(glGetUniformLocation(progProgBlur_, "uSharp"), 0);
+    glUniform1i(Uniform(progProgBlur_, "uSharp"), 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, blurred);
-    glUniform1i(glGetUniformLocation(progProgBlur_, "uBlurred"), 1);
-    glUniform2f(glGetUniformLocation(progProgBlur_, "uResolution"), static_cast<float>(w),
+    glUniform1i(Uniform(progProgBlur_, "uBlurred"), 1);
+    glUniform2f(Uniform(progProgBlur_, "uResolution"), static_cast<float>(w),
                 static_cast<float>(h));
-    glUniform4f(glGetUniformLocation(progProgBlur_, "uRect"), band.x, band.y, band.w, band.h);
-    glUniform3f(glGetUniformLocation(progProgBlur_, "uTint"), 0.502f, 0.502f, 0.502f);
-    glUniform1f(glGetUniformLocation(progProgBlur_, "uTintIntensity"), 0.8f);
+    glUniform4f(Uniform(progProgBlur_, "uRect"), band.x, band.y, band.w, band.h);
+    glUniform3f(Uniform(progProgBlur_, "uTint"), 0.502f, 0.502f, 0.502f);
+    glUniform1f(Uniform(progProgBlur_, "uTintIntensity"), 0.8f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glDisable(GL_SCISSOR_TEST);
 
@@ -4370,20 +4608,20 @@ void GlesRenderer::RenderBackground(int w, int h) {
     glViewport(0, 0, w, h);
     glDisable(GL_BLEND);
     glUseProgram(progBg_);
-    glUniform2f(glGetUniformLocation(progBg_, "uResolution"), static_cast<float>(w),
+    glUniform2f(Uniform(progBg_, "uResolution"), static_cast<float>(w),
                 static_cast<float>(h));
     // kArkTsGlass 场景：背景直接用 ArkTS 内容纹理（还没收到帧时退回照片）
     const bool useContent =
         scene_.load() == static_cast<int>(Scene::kArkTsGlass) && contentValid_;
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, useContent ? contentBlitTex_ : photoTex_);
-    glUniform1i(glGetUniformLocation(progBg_, "uPhoto"), 0);
-    glUniform1f(glGetUniformLocation(progBg_, "uContentMode"), useContent ? 1.0f : 0.0f);
-    glUniform2f(glGetUniformLocation(progBg_, "uPhotoSize"), static_cast<float>(photoW_),
+    glUniform1i(Uniform(progBg_, "uPhoto"), 0);
+    glUniform1f(Uniform(progBg_, "uContentMode"), useContent ? 1.0f : 0.0f);
+    glUniform2f(Uniform(progBg_, "uPhotoSize"), static_cast<float>(photoW_),
                 static_cast<float>(photoH_));
-    glUniform1f(glGetUniformLocation(progBg_, "uScrollRange"),
+    glUniform1f(Uniform(progBg_, "uScrollRange"),
                 params_.N(pid::kBackgroundScrollRange));
-    glUniform1f(glGetUniformLocation(progBg_, "uScroll"), scroll_.load());
+    glUniform1f(Uniform(progBg_, "uScroll"), scroll_.load());
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -4453,18 +4691,18 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
     glUseProgram(progGlass_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, bgTex_);
-    glUniform1i(glGetUniformLocation(progGlass_, "uBackdrop"), 0);
+    glUniform1i(Uniform(progGlass_, "uBackdrop"), 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, blurResult);
-    glUniform1i(glGetUniformLocation(progGlass_, "uBlurred"), 1);
+    glUniform1i(Uniform(progGlass_, "uBlurred"), 1);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, labelTex_);
-    glUniform1i(glGetUniformLocation(progGlass_, "uLabels"), 2);
-    glUniform2f(glGetUniformLocation(progGlass_, "uLabelSize"), static_cast<float>(labelW_),
+    glUniform1i(Uniform(progGlass_, "uLabels"), 2);
+    glUniform2f(Uniform(progGlass_, "uLabelSize"), static_cast<float>(labelW_),
                 static_cast<float>(labelH_));
-    glUniform2f(glGetUniformLocation(progGlass_, "uResolution"), static_cast<float>(w),
+    glUniform2f(Uniform(progGlass_, "uResolution"), static_cast<float>(w),
                 static_cast<float>(h));
-    glUniform2f(glGetUniformLocation(progGlass_, "uTexel"), texelX, texelY);
+    glUniform2f(Uniform(progGlass_, "uTexel"), texelX, texelY);
 
     const float marginH = params_.Px(pid::kOuterPaddingH);
     const float marginV = params_.Px(pid::kOuterPaddingV);
@@ -4501,70 +4739,70 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
     const float panelH = barH * panelScale;
     const float panelCx = marginH + panelOffset + barW * 0.5f;
     const float panelCy = marginV + barH * 0.5f;
-    glUniform4f(glGetUniformLocation(progGlass_, "uGlassRect"), panelCx - panelW * 0.5f,
+    glUniform4f(Uniform(progGlass_, "uGlassRect"), panelCx - panelW * 0.5f,
                 panelCy - panelH * 0.5f, panelW, panelH);
     // 底板四角半径（等值）：参数 68，钳到高度一半；按压时随底板一起放大
     const float panelRadiusPx = panelRadius * panelScale;
-    glUniform4f(glGetUniformLocation(progGlass_, "uRadii"), panelRadiusPx, panelRadiusPx,
+    glUniform4f(Uniform(progGlass_, "uRadii"), panelRadiusPx, panelRadiusPx,
                 panelRadiusPx, panelRadiusPx);
-    glUniform1f(glGetUniformLocation(progGlass_, "uRefractionHeight"),
+    glUniform1f(Uniform(progGlass_, "uRefractionHeight"),
                 mode == 2 ? 0.0f : params_.Px(pid::kRefractionHeight));
     // 上游 Lens.kt 送的是 **-refractionAmount**：位移因此指向形状内侧，边缘是"压缩/内折"
     // 的液态玻璃感。直接送正值 = 采样朝形状外 → 边缘外凸成凸透镜。必须同样取负。
-    glUniform1f(glGetUniformLocation(progGlass_, "uRefractionAmount"),
+    glUniform1f(Uniform(progGlass_, "uRefractionAmount"),
                 -params_.Px(pid::kRefractionAmount));
-    glUniform1f(glGetUniformLocation(progGlass_, "uDispersion"),
+    glUniform1f(Uniform(progGlass_, "uDispersion"),
                 (params_.B(0) && mode != 1) ? 1.0f : 0.0f);   // bool 0 = 底座色散
     // depthEffect（bool 6）：折射方向叠一层径向分量
-    glUniform1f(glGetUniformLocation(progGlass_, "uDepthEffect"),
+    glUniform1f(Uniform(progGlass_, "uDepthEffect"),
                 params_.B(bid::kDepthEffect) ? 1.0f : 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uSurfaceAlpha"),
+    glUniform1f(Uniform(progGlass_, "uSurfaceAlpha"),
                 mode == 3 ? 0.0f : params_.N(pid::kContainerAlpha));
     // 目录场景新增的 uniform 在底板 pass 上保持"恒等"值，外观与旧版逐像素一致
-    glUniform1f(glGetUniformLocation(progGlass_, "uScaleX"), 1.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uScaleY"), 1.0f);
-    glUniform3f(glGetUniformLocation(progGlass_, "uSurfaceColor"),
+    glUniform1f(Uniform(progGlass_, "uScaleX"), 1.0f);
+    glUniform1f(Uniform(progGlass_, "uScaleY"), 1.0f);
+    glUniform3f(Uniform(progGlass_, "uSurfaceColor"),
                 params_.N(pid::kSurfaceColorR), params_.N(pid::kSurfaceColorG),
                 params_.N(pid::kSurfaceColorB));
-    glUniform2f(glGetUniformLocation(progGlass_, "uSampleScale"), 1.0f, 1.0f);
-    glUniform2f(glGetUniformLocation(progGlass_, "uSamplePivot"), 0.0f, 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uG2Factor"), 0.45f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uRimClarity"), 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uBevelAlphaScale"), 1.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uAmbientIntensity"), 0.38f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uBlurRadius"), blurRadius);
-    glUniform1f(glGetUniformLocation(progGlass_, "uVibrancy"), params_.B(1) ? 1.5f : 1.0f);  // 提饱和
+    glUniform2f(Uniform(progGlass_, "uSampleScale"), 1.0f, 1.0f);
+    glUniform2f(Uniform(progGlass_, "uSamplePivot"), 0.0f, 0.0f);
+    glUniform1f(Uniform(progGlass_, "uG2Factor"), 0.45f);
+    glUniform1f(Uniform(progGlass_, "uRimClarity"), 0.0f);
+    glUniform1f(Uniform(progGlass_, "uBevelAlphaScale"), 1.0f);
+    glUniform1f(Uniform(progGlass_, "uAmbientIntensity"), 0.38f);
+    glUniform1f(Uniform(progGlass_, "uBlurRadius"), blurRadius);
+    glUniform1f(Uniform(progGlass_, "uVibrancy"), params_.B(1) ? 1.5f : 1.0f);  // 提饱和
     // colorControls（亮度/对比度/饱和度）+ 效果不透明度（参数 77..80）
-    glUniform1f(glGetUniformLocation(progGlass_, "uBrightness"), params_.N(pid::kColorBrightness));
-    glUniform1f(glGetUniformLocation(progGlass_, "uContrast"), params_.N(pid::kColorContrast));
-    glUniform1f(glGetUniformLocation(progGlass_, "uSaturation"), params_.N(pid::kColorSaturation));
-    glUniform1f(glGetUniformLocation(progGlass_, "uEffectOpacity"),
+    glUniform1f(Uniform(progGlass_, "uBrightness"), params_.N(pid::kColorBrightness));
+    glUniform1f(Uniform(progGlass_, "uContrast"), params_.N(pid::kColorContrast));
+    glUniform1f(Uniform(progGlass_, "uSaturation"), params_.N(pid::kColorSaturation));
+    glUniform1f(Uniform(progGlass_, "uEffectOpacity"),
                 params_.N(pid::kEffectOpacity));
-    glUniform1f(glGetUniformLocation(progGlass_, "uPlainHighlight"),
+    glUniform1f(Uniform(progGlass_, "uPlainHighlight"),
                 params_.B(bid::kPlainHighlight) ? 1.0f : 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uHighlight"), 0.5f);   // Highlight.Default alpha
+    glUniform1f(Uniform(progGlass_, "uHighlight"), 0.5f);   // Highlight.Default alpha
     // 棱边高光：环宽 = ceil(0.5dp*4) = 2px，外缘柔化 = blurRadius 0.25dp*4 = 1px
     const float hlWidthPx = std::max(1.0f, std::ceil(params_.Px(pid::kHighlightWidth)));
-    glUniform1f(glGetUniformLocation(progGlass_, "uHighlightWidth"), hlWidthPx);
-    glUniform1f(glGetUniformLocation(progGlass_, "uHighlightBlur"), hlWidthPx * 0.5f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uAmbient"), params_.B(5) ? 1.0f : 0.0f);
+    glUniform1f(Uniform(progGlass_, "uHighlightWidth"), hlWidthPx);
+    glUniform1f(Uniform(progGlass_, "uHighlightBlur"), hlWidthPx * 0.5f);
+    glUniform1f(Uniform(progGlass_, "uAmbient"), params_.B(5) ? 1.0f : 0.0f);
     // 外投影：模糊半径 / 向下偏移 / 有效不透明度（参数 70/71/72）。
     // 按压时换成"大范围 / 更弱 / 更散"的一圈（参数 92/93）：胶囊鼓出底板后，贴着
     // 轮廓的窄投影会紧贴鼓出的胶囊露出一圈暗边，大模糊 + 低强度的环境影既避开暗边，又给按压鼓出留出体积感。
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadowBlur"),
+    glUniform1f(Uniform(progGlass_, "uShadowBlur"),
                 lerpN(pid::kShadowBlur, pid::kShadowBlurPress, animPress) * params_.Density());
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadowOffset"), params_.Px(pid::kShadowOffset));
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadowAlpha"),
+    glUniform1f(Uniform(progGlass_, "uShadowOffset"), params_.Px(pid::kShadowOffset));
+    glUniform1f(Uniform(progGlass_, "uShadowAlpha"),
                 lerpN(pid::kShadowAlpha, pid::kShadowAlphaPress, animPress));
     // 页签文字**不**进场景纹理：它由 pass 5 叠加（形状外常态色 / 形状内凸显色）。
     // 若在这里画进场景，指示器的透镜会先采到常态字形，再叠凸显色字形 —— 两套重影，
     // 而且拖动时常态字形会被透镜拖着一起动（参考实现里文字是不动的）。
-    glUniform1f(glGetUniformLocation(progGlass_, "uShowLabels"), 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uOverlayMode"), 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uShadow"), 1.0f);
+    glUniform1f(Uniform(progGlass_, "uShowLabels"), 0.0f);
+    glUniform1f(Uniform(progGlass_, "uOverlayMode"), 0.0f);
+    glUniform1f(Uniform(progGlass_, "uShadow"), 1.0f);
     // 内阴影是顶部按钮才有的（参数 18）；底板与浮动件传 0 = 关
-    glUniform1f(glGetUniformLocation(progGlass_, "uInnerRadius"), 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uInnerAlpha"), 0.0f);
+    glUniform1f(Uniform(progGlass_, "uInnerRadius"), 0.0f);
+    glUniform1f(Uniform(progGlass_, "uInnerAlpha"), 0.0f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     // ---- pass 4b: 跟手光斑（对齐参考实现的 InteractiveHighlight）----
@@ -4586,18 +4824,18 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
         // 光斑跟底板一起缩放（绕底板中心）：形状 / 圆角 / 中心都乘 panelScale。
         // 否则底板放大后光斑仍裁在未缩放矩形里，端头会露出没被加白的月牙。
         glowX = panelCx + (glowX - panelCx) * panelScale;
-        glUniform2f(glGetUniformLocation(progGlow_, "uResolution"), static_cast<float>(w),
+        glUniform2f(Uniform(progGlow_, "uResolution"), static_cast<float>(w),
                     static_cast<float>(h));
-        glUniform4f(glGetUniformLocation(progGlow_, "uGlassRect"), panelCx - panelW * 0.5f,
+        glUniform4f(Uniform(progGlow_, "uGlassRect"), panelCx - panelW * 0.5f,
                     panelCy - panelH * 0.5f, panelW, panelH);
-        glUniform4f(glGetUniformLocation(progGlow_, "uRadii"), panelRadiusPx, panelRadiusPx,
+        glUniform4f(Uniform(progGlow_, "uRadii"), panelRadiusPx, panelRadiusPx,
                     panelRadiusPx, panelRadiusPx);
-        glUniform1f(glGetUniformLocation(progGlow_, "uProgress"), animGlowPress);
-        glUniform1f(glGetUniformLocation(progGlow_, "uFlat"), params_.N(pid::kGlowFlat));
-        glUniform1f(glGetUniformLocation(progGlow_, "uRadial"), params_.N(pid::kGlowRadial));
-        glUniform1f(glGetUniformLocation(progGlow_, "uRadiusFactor"),
+        glUniform1f(Uniform(progGlow_, "uProgress"), animGlowPress);
+        glUniform1f(Uniform(progGlow_, "uFlat"), params_.N(pid::kGlowFlat));
+        glUniform1f(Uniform(progGlow_, "uRadial"), params_.N(pid::kGlowRadial));
+        glUniform1f(Uniform(progGlow_, "uRadiusFactor"),
                     params_.N(pid::kGlowRadiusFactor));
-        glUniform2f(glGetUniformLocation(progGlow_, "uCenter"), glowX, panelCy);
+        glUniform2f(Uniform(progGlow_, "uCenter"), glowX, panelCy);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_BLEND);
@@ -4610,14 +4848,14 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
     glUseProgram(progIndicator_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, sceneTex_);
-    glUniform1i(glGetUniformLocation(progIndicator_, "uScene"), 0);
+    glUniform1i(Uniform(progIndicator_, "uScene"), 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, labelAccentTex_);
-    glUniform1i(glGetUniformLocation(progIndicator_, "uLabelsAccent"), 1);
+    glUniform1i(Uniform(progIndicator_, "uLabelsAccent"), 1);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, labelTex_);
-    glUniform1i(glGetUniformLocation(progIndicator_, "uLabels"), 2);
-    glUniform2f(glGetUniformLocation(progIndicator_, "uResolution"), static_cast<float>(w),
+    glUniform1i(Uniform(progIndicator_, "uLabels"), 2);
+    glUniform2f(Uniform(progIndicator_, "uResolution"), static_cast<float>(w),
                 static_cast<float>(h));
 
     // 指示器几何由动画状态驱动（跟手 / 弹簧 / 按压缩放 / 速度形变）
@@ -4660,71 +4898,71 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
     const float contentScale =
         std::max(0.5f, 1.0f - params_.N(pid::kPressSampleShrink) * animPress);
 
-    glUniform4f(glGetUniformLocation(progIndicator_, "uRect"), indX, indY, indW, indH);
+    glUniform4f(Uniform(progIndicator_, "uRect"), indX, indY, indW, indH);
     // 胶囊 = 四角等半径
     const float indRadius = indH * 0.5f;
-    glUniform4f(glGetUniformLocation(progIndicator_, "uRadii"), indRadius, indRadius, indRadius,
+    glUniform4f(Uniform(progIndicator_, "uRadii"), indRadius, indRadius, indRadius,
                 indRadius);
     // 页签文字的映射：位图贴在底板矩形上（底板视差偏移也算进去）。
     // 形状外按屏幕坐标采常态色位图，形状内按折射坐标采凸显色位图。
-    glUniform4f(glGetUniformLocation(progIndicator_, "uLabelRect"), marginH + panelOffset,
+    glUniform4f(Uniform(progIndicator_, "uLabelRect"), marginH + panelOffset,
                 marginV, barW, barH);
-    glUniform2f(glGetUniformLocation(progIndicator_, "uLabelSize"), static_cast<float>(labelW_),
+    glUniform2f(Uniform(progIndicator_, "uLabelSize"), static_cast<float>(labelW_),
                 static_cast<float>(labelH_));
-    glUniform1f(glGetUniformLocation(progIndicator_, "uLabelSlots"), 3.0f);   // 首页 / 搜索 / 我的
-    glUniform1f(glGetUniformLocation(progIndicator_, "uShowTabLabels"), 1.0f);
+    glUniform1f(Uniform(progIndicator_, "uLabelSlots"), 3.0f);   // 首页 / 搜索 / 我的
+    glUniform1f(Uniform(progIndicator_, "uShowTabLabels"), 1.0f);
     // 按压时只有凸显色文字放大（参考实现的 LocalLiquidBottomTabScale = lerp(1, 1.2, press)）：
     // 放大比例跟着 press 弹簧走，松手自动回到 1
-    glUniform1f(glGetUniformLocation(progIndicator_, "uLabelPressScale"),
+    glUniform1f(Uniform(progIndicator_, "uLabelPressScale"),
                 params_.N(pid::kPressLabelScale) * animPress);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uScaleX"), scaleX);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uScaleY"), scaleY);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uShapeScaleX"), pressScaleX);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uShapeScaleY"), pressScaleY);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uPressScale"), contentScale);
+    glUniform1f(Uniform(progIndicator_, "uScaleX"), scaleX);
+    glUniform1f(Uniform(progIndicator_, "uScaleY"), scaleY);
+    glUniform1f(Uniform(progIndicator_, "uShapeScaleX"), pressScaleX);
+    glUniform1f(Uniform(progIndicator_, "uShapeScaleY"), pressScaleY);
+    glUniform1f(Uniform(progIndicator_, "uPressScale"), contentScale);
     // 指示器透镜：静止/拖动两组值按 press 线性插值（与参考实现的 lerp(rest, drag, press) 一致）
     const float lensH = lerpN(pid::kRefractionHeightRest, pid::kRefractionHeightDrag, animPress);
     const float lensA = lerpN(pid::kRefractionAmountRest, pid::kRefractionAmountDrag, animPress);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uRefractionHeight"),
+    glUniform1f(Uniform(progIndicator_, "uRefractionHeight"),
                 mode == 2 ? 0.0f : lensH * params_.Density());
     // 同底板：上游对 amount 取负（-refractionAmount），位移朝内才是液态玻璃的边缘压缩
-    glUniform1f(glGetUniformLocation(progIndicator_, "uRefractionAmount"),
+    glUniform1f(Uniform(progIndicator_, "uRefractionAmount"),
                 -lensA * params_.Density());
-    glUniform1f(glGetUniformLocation(progIndicator_, "uDispersion"),
+    glUniform1f(Uniform(progIndicator_, "uDispersion"),
                 (params_.B(2) && mode != 1) ? 1.0f : 0.0f);   // bool 2 = 指示器色散
     // depthEffect（bool 6）与底板共用同一个开关（上游页签指示器不用，默认关）
-    glUniform1f(glGetUniformLocation(progIndicator_, "uDepthEffect"),
+    glUniform1f(Uniform(progIndicator_, "uDepthEffect"),
                 params_.B(bid::kDepthEffect) ? 1.0f : 0.0f);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uTint"),
+    glUniform1f(Uniform(progIndicator_, "uTint"),
                 mode == 3 ? 0.0f : lerpN(pid::kTintRest, pid::kTintDrag, animPress));
     // 表面白（参数 36 / 46）：同一层 onDrawSurface 上叠一层白，默认两端都是 0（等价关闭）
-    glUniform1f(glGetUniformLocation(progIndicator_, "uSurfaceWhite"),
+    glUniform1f(Uniform(progIndicator_, "uSurfaceWhite"),
                 mode == 3 ? 0.0f : lerpN(pid::kSurfaceWhiteRest, pid::kSurfaceWhiteDrag, animPress));
-    glUniform1f(glGetUniformLocation(progIndicator_, "uHighlight"),
+    glUniform1f(Uniform(progIndicator_, "uHighlight"),
                 lerpN(pid::kHighlightRest, pid::kHighlightDrag, animPress));
-    glUniform1f(glGetUniformLocation(progIndicator_, "uHighlightWidth"), hlWidthPx);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uHighlightBlur"), hlWidthPx * 0.5f);
+    glUniform1f(Uniform(progIndicator_, "uHighlightWidth"), hlWidthPx);
+    glUniform1f(Uniform(progIndicator_, "uHighlightBlur"), hlWidthPx * 0.5f);
     // 外缘细灰线：按压态渐入（非常微弱，只做轮廓对比用；静止态为 0）
-    glUniform1f(glGetUniformLocation(progIndicator_, "uEdgeLine"), 0.28f * animPress);
+    glUniform1f(Uniform(progIndicator_, "uEdgeLine"), 0.28f * animPress);
     // 指示器投影：对齐滑块旋钮按压态的"贴边投影"，但走"更大范围 / 更柔 / 更淡"档：
     // 模糊 9→11dp、下移 2→1.5dp、强度 0.045→0.06，随 press 渐入。
     // 按压时启用反向纵向渐变（uShadowSpreadV = press）：影子只落在轮廓下方 / 两侧（顶边不投）。
     const float indShadowDp = params_.Density();
-    glUniform1f(glGetUniformLocation(progIndicator_, "uShadowBlur"),
+    glUniform1f(Uniform(progIndicator_, "uShadowBlur"),
                 (9.0f + 2.0f * animPress) * indShadowDp);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uShadowOffset"),
+    glUniform1f(Uniform(progIndicator_, "uShadowOffset"),
                 (2.0f - 0.5f * animPress) * indShadowDp);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uShadowAlpha"),
+    glUniform1f(Uniform(progIndicator_, "uShadowAlpha"),
                 (0.045f + 0.015f * animPress) * animPress);
-    glUniform1f(glGetUniformLocation(progIndicator_, "uShadowSpreadV"), animPress);
+    glUniform1f(Uniform(progIndicator_, "uShadowSpreadV"), animPress);
     // 内阴影：半径/强度两组值按 press 插值；强度再乘上游 InnerShadow 的颜色黑 alpha 0.15
-    glUniform1f(glGetUniformLocation(progIndicator_, "uInnerRadius"),
+    glUniform1f(Uniform(progIndicator_, "uInnerRadius"),
                 lerpN(pid::kInnerShadowRadiusRest, pid::kInnerShadowRadiusDrag, animPress) *
                     params_.Density());
-    glUniform1f(glGetUniformLocation(progIndicator_, "uInnerAlpha"),
+    glUniform1f(Uniform(progIndicator_, "uInnerAlpha"),
                 lerpN(pid::kInnerShadowAlphaRest, pid::kInnerShadowAlphaDrag, animPress) * 0.15f);
     // 指示器模糊（参数 65/66，默认 0）
-    glUniform1f(glGetUniformLocation(progIndicator_, "uSceneBlur"),
+    glUniform1f(Uniform(progIndicator_, "uSceneBlur"),
                 lerpN(pid::kIndicatorBlurRest, pid::kIndicatorBlurDrag, animPress) *
                     params_.Density());
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -4742,41 +4980,41 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
                    params_.Px(pid::kShadowBlur) + params_.Px(pid::kShadowOffset) + 4.0f, w, h);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, sceneTex_);
-    glUniform1i(glGetUniformLocation(progGlass_, "uBackdrop"), 0);
+    glUniform1i(Uniform(progGlass_, "uBackdrop"), 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, blurResult);
-    glUniform1i(glGetUniformLocation(progGlass_, "uBlurred"), 1);
-    glUniform1f(glGetUniformLocation(progGlass_, "uShowLabels"), 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uOverlayMode"), 1.0f);
-    glUniform4f(glGetUniformLocation(progGlass_, "uGlassRect"), floatX_.load(), floatY_.load(),
+    glUniform1i(Uniform(progGlass_, "uBlurred"), 1);
+    glUniform1f(Uniform(progGlass_, "uShowLabels"), 0.0f);
+    glUniform1f(Uniform(progGlass_, "uOverlayMode"), 1.0f);
+    glUniform4f(Uniform(progGlass_, "uGlassRect"), floatX_.load(), floatY_.load(),
                 barW, barH);
     // 浮动件是四角独立圆角的展示面（参数 73..76）：每角钳到高度一半，避免圆角互相吃掉。
     const float floatRadiusMax = barH * 0.5f;
-    glUniform4f(glGetUniformLocation(progGlass_, "uRadii"),
+    glUniform4f(Uniform(progGlass_, "uRadii"),
                 std::min(params_.Px(pid::kFloatCornerTL), floatRadiusMax),
                 std::min(params_.Px(pid::kFloatCornerTR), floatRadiusMax),
                 std::min(params_.Px(pid::kFloatCornerBR), floatRadiusMax),
                 std::min(params_.Px(pid::kFloatCornerBL), floatRadiusMax));
     // 材质与底板一致（同一个 program 且共享参数）：这里显式再写一遍，避免残留上一 pass 的状态
-    glUniform1f(glGetUniformLocation(progGlass_, "uDepthEffect"),
+    glUniform1f(Uniform(progGlass_, "uDepthEffect"),
                 params_.B(bid::kDepthEffect) ? 1.0f : 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uBrightness"), params_.N(pid::kColorBrightness));
-    glUniform1f(glGetUniformLocation(progGlass_, "uContrast"), params_.N(pid::kColorContrast));
-    glUniform1f(glGetUniformLocation(progGlass_, "uSaturation"), params_.N(pid::kColorSaturation));
-    glUniform1f(glGetUniformLocation(progGlass_, "uEffectOpacity"),
+    glUniform1f(Uniform(progGlass_, "uBrightness"), params_.N(pid::kColorBrightness));
+    glUniform1f(Uniform(progGlass_, "uContrast"), params_.N(pid::kColorContrast));
+    glUniform1f(Uniform(progGlass_, "uSaturation"), params_.N(pid::kColorSaturation));
+    glUniform1f(Uniform(progGlass_, "uEffectOpacity"),
                 params_.N(pid::kEffectOpacity));
-    glUniform1f(glGetUniformLocation(progGlass_, "uPlainHighlight"),
+    glUniform1f(Uniform(progGlass_, "uPlainHighlight"),
                 params_.B(bid::kPlainHighlight) ? 1.0f : 0.0f);
     // 浮动件同样把新增 uniform 复位（同一个 program，避免上一 pass 的残留）
-    glUniform1f(glGetUniformLocation(progGlass_, "uScaleX"), 1.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uScaleY"), 1.0f);
-    glUniform3f(glGetUniformLocation(progGlass_, "uSurfaceColor"), 1.0f, 1.0f, 1.0f);
-    glUniform2f(glGetUniformLocation(progGlass_, "uSampleScale"), 1.0f, 1.0f);
-    glUniform2f(glGetUniformLocation(progGlass_, "uSamplePivot"), 0.0f, 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uG2Factor"), 0.45f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uRimClarity"), 0.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uBevelAlphaScale"), 1.0f);
-    glUniform1f(glGetUniformLocation(progGlass_, "uAmbientIntensity"), 0.38f);
+    glUniform1f(Uniform(progGlass_, "uScaleX"), 1.0f);
+    glUniform1f(Uniform(progGlass_, "uScaleY"), 1.0f);
+    glUniform3f(Uniform(progGlass_, "uSurfaceColor"), 1.0f, 1.0f, 1.0f);
+    glUniform2f(Uniform(progGlass_, "uSampleScale"), 1.0f, 1.0f);
+    glUniform2f(Uniform(progGlass_, "uSamplePivot"), 0.0f, 0.0f);
+    glUniform1f(Uniform(progGlass_, "uG2Factor"), 0.45f);
+    glUniform1f(Uniform(progGlass_, "uRimClarity"), 0.0f);
+    glUniform1f(Uniform(progGlass_, "uBevelAlphaScale"), 1.0f);
+    glUniform1f(Uniform(progGlass_, "uAmbientIntensity"), 0.38f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
@@ -4805,43 +5043,43 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
         glUseProgram(progGlass_);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, bgTex_);
-        glUniform1i(glGetUniformLocation(progGlass_, "uBackdrop"), 0);
+        glUniform1i(Uniform(progGlass_, "uBackdrop"), 0);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, btnBlurResult);
-        glUniform1i(glGetUniformLocation(progGlass_, "uBlurred"), 1);
-        glUniform2f(glGetUniformLocation(progGlass_, "uResolution"), static_cast<float>(w),
+        glUniform1i(Uniform(progGlass_, "uBlurred"), 1);
+        glUniform2f(Uniform(progGlass_, "uResolution"), static_cast<float>(w),
                     static_cast<float>(h));
-        glUniform2f(glGetUniformLocation(progGlass_, "uTexel"), texelX, texelY);
-        glUniform1f(glGetUniformLocation(progGlass_, "uShowLabels"), 0.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uOverlayMode"), 1.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uVibrancy"), params_.B(1) ? 1.5f : 1.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uSurfaceAlpha"),
+        glUniform2f(Uniform(progGlass_, "uTexel"), texelX, texelY);
+        glUniform1f(Uniform(progGlass_, "uShowLabels"), 0.0f);
+        glUniform1f(Uniform(progGlass_, "uOverlayMode"), 1.0f);
+        glUniform1f(Uniform(progGlass_, "uVibrancy"), params_.B(1) ? 1.5f : 1.0f);
+        glUniform1f(Uniform(progGlass_, "uSurfaceAlpha"),
                     mode == 3 ? 0.0f : params_.N(pid::kContainerAlpha));
-        glUniform1f(glGetUniformLocation(progGlass_, "uDispersion"),
+        glUniform1f(Uniform(progGlass_, "uDispersion"),
                     (params_.B(0) && mode != 1) ? 1.0f : 0.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uBlurRadius"), btnBlurRadius);
-        glUniform1f(glGetUniformLocation(progGlass_, "uHighlightWidth"), hlWidthPx);
-        glUniform1f(glGetUniformLocation(progGlass_, "uHighlightBlur"), hlWidthPx * 0.5f);
+        glUniform1f(Uniform(progGlass_, "uBlurRadius"), btnBlurRadius);
+        glUniform1f(Uniform(progGlass_, "uHighlightWidth"), hlWidthPx);
+        glUniform1f(Uniform(progGlass_, "uHighlightBlur"), hlWidthPx * 0.5f);
         // 上游按钮只有 DefaultHighlight，不叠环境光 / 不用 depthEffect / 不做色彩控制
-        glUniform1f(glGetUniformLocation(progGlass_, "uAmbient"), 0.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uDepthEffect"), 0.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uPlainHighlight"), 0.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uBrightness"), 0.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uContrast"), 1.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uSaturation"), 1.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uEffectOpacity"), 1.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uShadowBlur"), params_.Px(pid::kShadowBlur));
-        glUniform1f(glGetUniformLocation(progGlass_, "uShadowOffset"),
+        glUniform1f(Uniform(progGlass_, "uAmbient"), 0.0f);
+        glUniform1f(Uniform(progGlass_, "uDepthEffect"), 0.0f);
+        glUniform1f(Uniform(progGlass_, "uPlainHighlight"), 0.0f);
+        glUniform1f(Uniform(progGlass_, "uBrightness"), 0.0f);
+        glUniform1f(Uniform(progGlass_, "uContrast"), 1.0f);
+        glUniform1f(Uniform(progGlass_, "uSaturation"), 1.0f);
+        glUniform1f(Uniform(progGlass_, "uEffectOpacity"), 1.0f);
+        glUniform1f(Uniform(progGlass_, "uShadowBlur"), params_.Px(pid::kShadowBlur));
+        glUniform1f(Uniform(progGlass_, "uShadowOffset"),
                     params_.Px(pid::kShadowOffset));
-        glUniform1f(glGetUniformLocation(progGlass_, "uShadow"), 1.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uScaleX"), 1.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uScaleY"), 1.0f);
-        glUniform3f(glGetUniformLocation(progGlass_, "uSurfaceColor"), 1.0f, 1.0f, 1.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uG2Factor"), 0.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uRimClarity"), 0.0f);
-        glUniform1f(glGetUniformLocation(progGlass_, "uBevelAlphaScale"), 1.0f);
+        glUniform1f(Uniform(progGlass_, "uShadow"), 1.0f);
+        glUniform1f(Uniform(progGlass_, "uScaleX"), 1.0f);
+        glUniform1f(Uniform(progGlass_, "uScaleY"), 1.0f);
+        glUniform3f(Uniform(progGlass_, "uSurfaceColor"), 1.0f, 1.0f, 1.0f);
+        glUniform1f(Uniform(progGlass_, "uG2Factor"), 0.0f);
+        glUniform1f(Uniform(progGlass_, "uRimClarity"), 0.0f);
+        glUniform1f(Uniform(progGlass_, "uBevelAlphaScale"), 1.0f);
         // uSampleScale / uSamplePivot 是**逐按钮**的（见下面循环），这里不再设恒等值
-        glUniform1f(glGetUniformLocation(progGlass_, "uAmbientIntensity"), 0.38f);
+        glUniform1f(Uniform(progGlass_, "uAmbientIntensity"), 0.38f);
 
         // 每个按钮只算自己那一块（外扩覆盖它的外投影）
         const float btnShadowPad = params_.Px(pid::kShadowBlur) + params_.Px(pid::kShadowOffset) + 4.0f;
@@ -4856,29 +5094,29 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
             const float cx = left + btnSize * 0.5f;
             const float cy = bottom + btnSize * 0.5f;
             SetScissorRect(cx - size * 0.5f, cy - size * 0.5f, size, size, btnShadowPad, w, h);
-            glUniform4f(glGetUniformLocation(progGlass_, "uGlassRect"), cx - size * 0.5f,
+            glUniform4f(Uniform(progGlass_, "uGlassRect"), cx - size * 0.5f,
                         cy - size * 0.5f, size, size);
             const float btnRadius = size * 0.5f;
-            glUniform4f(glGetUniformLocation(progGlass_, "uRadii"), btnRadius, btnRadius,
+            glUniform4f(Uniform(progGlass_, "uRadii"), btnRadius, btnRadius,
                         btnRadius, btnRadius);
             // 按压采样缩小：与旋钮同量级，绕按钮中心（形状的按压缩放也绕中心）
             const float btnSampleScale = 1.0f - kButtonPressSampleShrink * press;
-            glUniform2f(glGetUniformLocation(progGlass_, "uSampleScale"), btnSampleScale,
+            glUniform2f(Uniform(progGlass_, "uSampleScale"), btnSampleScale,
                         btnSampleScale);
-            glUniform2f(glGetUniformLocation(progGlass_, "uSamplePivot"), cx, cy);
+            glUniform2f(Uniform(progGlass_, "uSamplePivot"), cx, cy);
             // 上游按钮的透镜高度与强度同值：refractionRest + refractionPress × press
             const float lensPx = iconLensRest + iconLensPress * press;
-            glUniform1f(glGetUniformLocation(progGlass_, "uRefractionHeight"), lensPx);
+            glUniform1f(Uniform(progGlass_, "uRefractionHeight"), lensPx);
             // 同底板：上游对 amount 取负（-refractionAmount）
-            glUniform1f(glGetUniformLocation(progGlass_, "uRefractionAmount"), -lensPx);
-            glUniform1f(glGetUniformLocation(progGlass_, "uHighlight"),
+            glUniform1f(Uniform(progGlass_, "uRefractionAmount"), -lensPx);
+            glUniform1f(Uniform(progGlass_, "uHighlight"),
                         iconHlRest + iconHlPress * press);
             // 阴影 alpha = Shadow.Default 的黑 alpha 0.1 × (rest + press × press)
-            glUniform1f(glGetUniformLocation(progGlass_, "uShadowAlpha"),
+            glUniform1f(Uniform(progGlass_, "uShadowAlpha"),
                         (iconShRest + iconShPress * press) * 0.1f);
             // 内阴影：半径 = id 18 × press，alpha = press × InnerShadow 的黑 alpha 0.15
-            glUniform1f(glGetUniformLocation(progGlass_, "uInnerRadius"), iconInnerPx * press);
-            glUniform1f(glGetUniformLocation(progGlass_, "uInnerAlpha"), press * 0.15f);
+            glUniform1f(Uniform(progGlass_, "uInnerRadius"), iconInnerPx * press);
+            glUniform1f(Uniform(progGlass_, "uInnerAlpha"), press * 0.15f);
             glDrawArrays(GL_TRIANGLES, 0, 3);
         }
         glDisable(GL_SCISSOR_TEST);
@@ -4903,13 +5141,13 @@ void GlesRenderer::DrawTabsScene(int w, int h, int mode) {
             glUseProgram(progIcon_);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, iconTex_);
-            glUniform1i(glGetUniformLocation(progIcon_, "uIcons"), 0);
-            glUniform2f(glGetUniformLocation(progIcon_, "uResolution"), static_cast<float>(w),
+            glUniform1i(Uniform(progIcon_, "uIcons"), 0);
+            glUniform2f(Uniform(progIcon_, "uResolution"), static_cast<float>(w),
                         static_cast<float>(h));
-            glUniform2f(glGetUniformLocation(progIcon_, "uFirstRect"), left, bottom);
-            glUniform1f(glGetUniformLocation(progIcon_, "uBtnSize"), btnSize);
-            glUniform1f(glGetUniformLocation(progIcon_, "uSpacing"), ButtonSpacingPx());
-            glUniform1f(glGetUniformLocation(progIcon_, "uIconSize"), iconPx);
+            glUniform2f(Uniform(progIcon_, "uFirstRect"), left, bottom);
+            glUniform1f(Uniform(progIcon_, "uBtnSize"), btnSize);
+            glUniform1f(Uniform(progIcon_, "uSpacing"), ButtonSpacingPx());
+            glUniform1f(Uniform(progIcon_, "uIconSize"), iconPx);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glDisable(GL_SCISSOR_TEST);
             glDisable(GL_BLEND);
@@ -4942,6 +5180,7 @@ void GlesRenderer::LogFps() {
 }
 
 void GlesRenderer::RenderLoop(void *window) {
+    nativeWindow_ = window;
     if (!InitEgl(window)) {
         GERR("EGL init failed, render loop abort");
         DestroyEgl();
@@ -4955,6 +5194,7 @@ void GlesRenderer::RenderLoop(void *window) {
         running_.store(false);
         return;
     }
+    CreateVsync();
 
     const auto start = std::chrono::steady_clock::now();
     int lastW = 0;
@@ -4991,8 +5231,12 @@ void GlesRenderer::RenderLoop(void *window) {
         }
 
         const int64_t animNow = NowMs();
-        const float dt = (lastAnimMs_ == 0) ? 0.0f
-                                            : static_cast<float>(animNow - lastAnimMs_) / 1000.0f;
+        // 弹簧步长用纳秒时钟：按 vsync 出帧后帧间隔是 8.33ms，毫秒取整会让 dt 在 8/9ms 间跳，
+        // 弹簧轨迹带上 ±12% 的步长抖动
+        const int64_t animNowNs = MonoNs();
+        const float dt = (lastAnimNs_ == 0) ? 0.0f
+                                            : static_cast<float>(animNowNs - lastAnimNs_) / 1.0e9f;
+        lastAnimNs_ = animNowNs;
         lastAnimMs_ = animNow;
         gSpringMotion = 0.0f;
         UpdateAnim(dt);
@@ -5049,15 +5293,30 @@ void GlesRenderer::RenderLoop(void *window) {
 
         // ---- 空闲检测：没有任何"会改变画面"的输入就不画 ----
         // 判定依据（任一成立就要画）：
-        //   ① 输入/参数/场景/尺寸变化（forceRedraw_）
+        //   ① 输入/参数/场景/尺寸变化（forceRedraw_）；上一轮等节拍时带过来的"要画"（carryActive_）
         //   ② 纹理重传（uploads）
-        //   ③ 弹簧还在动（gSpringMotion 超过阈值）
+        //   ③ 弹簧还在动（位移速率超过阈值），或刚落定、对齐后要再画一帧（SettleTabSprings）
         //   ④ 交互窗口内（触摸后 400ms，保证跟手流畅）
         //   ⑤ ArkTS 内容纹理有新帧
         // 不画时 surface 保留最后一帧，屏幕内容不变；渲染线程只睡 16ms 醒来再查。
         const bool interacting = (animNow - lastTouchMs_.load()) < kInteractiveWindowMs;
-        const bool active = forceRedraw_.exchange(false) || uploads ||
-                            gSpringMotion > kIdleMotionEps || interacting || contentFrame;
+        const bool carried = carryActive_;
+        carryActive_ = false;
+        // 弹簧：按位移速率判（见 kIdleMotionRate）。判停的那一轮先过 SettleTabSprings：都贴着目标
+        // 就对齐、再画最后一帧（静止画面与帧时序无关）；还差得远（折返点误判）就当它还在动。
+        const float springStepSec = std::min(dt, kMaxSpringStepSec);
+        bool springing = springStepSec > 0.0f ? gSpringMotion > kIdleMotionRate * springStepSec
+                                              : wasSpringing_;
+        bool snapped = false;
+        if (!springing && wasSpringing_) {
+            const SpringSettle settle = SettleTabSprings();
+            // 位移恰为 0（刚度 0 之类卡住的弹簧）不算在动，免得一直出帧
+            springing = settle == SpringSettle::kFar && gSpringMotion > 0.0f;
+            snapped = settle == SpringSettle::kSnapped;
+        }
+        wasSpringing_ = springing;
+        const bool active = carried || forceRedraw_.exchange(false) || uploads || springing ||
+                            snapped || interacting || contentFrame;
         if (!active) {
             skippedFrames_++;
             std::this_thread::sleep_for(std::chrono::milliseconds(kNormalFrameMs));
@@ -5065,13 +5324,32 @@ void GlesRenderer::RenderLoop(void *window) {
             continue;
         }
 
-        PaceFrame();
+        // 出帧节拍：每个 vsync 周期最多一帧，出帧点在 vsync + δ（见 WaitForRenderSlot）；交互中
+        // 每个 vsync 都出，其余沿用原来 ~60fps 的档位。等过之后回顶部重新消费输入（最新的触摸 /
+        // 弹簧 / 内容帧），"这一轮要画"的判定带到下一轮 —— forceRedraw_ 已在本轮被 exchange 掉，
+        // 不带过去就会判成空闲。
+        if (!WaitForRenderSlot(interacting)) {
+            carryActive_ = true;
+            continue;
+        }
         DrawFrame(seconds);
+        // 期望上屏时间 = 现在（RenderService 直接消费 SURFACE 型 buffer 时生效）：合成时若有多张
+        // 已到期的 buffer 只取最新、丢弃较早的。不设的话按 FIFO 一次取一张 —— 手势开始时
+        // "立即出帧 + 节拍帧"落进同一个合成周期，队列里就一直多压一张，整段晚 1 帧上屏。
+        if (nativeWindow_ != nullptr) {
+            OH_NativeWindow_NativeWindowHandleOpt(reinterpret_cast<OHNativeWindow *>(nativeWindow_),
+                                                  SET_DESIRED_PRESENT_TIMESTAMP,
+                                                  static_cast<int64_t>(MonoNs()));
+        }
         eglSwapBuffers(display_, surface_);
+        // 记下这一帧所在的 vsync 周期并预约下一个 vsync（下一帧的节拍基准）
+        lastRenderVsyncNs_ = vsyncNs_.load();
+        RequestVsync();
         frameCount_++;
         LogFps();
     }
 
+    DestroyVsync();
     DestroyGl();
     DestroyEgl();
     running_.store(false);

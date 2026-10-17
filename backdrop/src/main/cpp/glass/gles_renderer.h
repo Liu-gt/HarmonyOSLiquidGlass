@@ -5,14 +5,17 @@
 #include <EGL/eglplatform.h>
 #include <GLES3/gl3.h>
 #include <native_image/native_image.h>
+#include <native_vsync/native_vsync.h>
 
 #include <atomic>
+#include <condition_variable>
 
 #include "glass_params.h"
 #include "glass_scene.h"
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <thread>
 
@@ -429,8 +432,57 @@ private:
     /** 空闲跳过计数（只用于日志）。 */
     int skippedFrames_ = 0;
 
-    /** 睡到本帧的时间点（eglSwapBuffers 已经阻塞时不会额外睡）。 */
+    /** 睡到本帧的时间点（没有 vsync 连接时的退回节拍）。 */
     void PaceFrame();
+
+    // ---- vsync 对齐出帧（见 WaitForRenderSlot）----
+    /** 渲染线程：建 vsync 连接（失败则退回 PaceFrame 的时间节拍）。 */
+    void CreateVsync();
+    void DestroyVsync();
+    /** 预约下一个 vsync 回调（一次性，每次出帧后重新预约）。 */
+    void RequestVsync();
+    static void OnVsyncCallback(long long timestamp, void *data);
+    /**
+     * 等到本帧的出帧点：每个 vsync 周期最多一帧，出帧点在 vsync + δ；fast = false 时帧间隔取
+     * 最接近 16ms 的 vsync 整数倍（沿用非交互 ~60fps 的档位）。没有 vsync 连接时退回 PaceFrame。
+     * 返回 true = 现在就画；false = 等过了，回循环顶部重新消费输入后再判定。
+     */
+    bool WaitForRenderSlot(bool fast);
+    OH_NativeVSync *vsync_ = nullptr;
+    /** XComponent 的原生窗口（设置期望上屏时间用，生命周期跟 surface）。 */
+    void *nativeWindow_ = nullptr;
+    /** 最近一次 vsync 时间戳（CLOCK_MONOTONIC ns，vsync 线程写）与周期（渲染线程查询）。 */
+    std::atomic<int64_t> vsyncNs_{0};
+    std::atomic<int64_t> vsyncPeriodNs_{0};
+    /** 渲染线程：上一帧画在哪个 vsync 周期（= 当时的 vsyncNs_），同一周期不画第二帧。 */
+    int64_t lastRenderVsyncNs_ = -1;
+    int64_t periodQueriedVsyncNs_ = -1;
+    bool vsyncClockLogged_ = false;
+    std::mutex vsyncWaitMutex_;
+    std::condition_variable vsyncWaitCv_;
+    /** 节拍等待后回到循环顶部时，把"这一轮要画"带到下一轮（forceRedraw_ 已被消费）。 */
+    bool carryActive_ = false;
+    /** 上一轮弹簧是否还在动（判停的那一轮做一次落定对齐，见 SettleTabSprings）。 */
+    bool wasSpringing_ = false;
+
+    /**
+     * 缓存的 uniform location（每帧几百次 glGetUniformLocation 是字符串查找）。
+     * name 必须是**字符串字面量**（按指针做键）；程序重建（DestroyGl）时清空。
+     */
+    GLint Uniform(GLuint program, const char *name);
+    struct UniformKey {
+        GLuint program;
+        const char *name;
+        bool operator==(const UniformKey &other) const {
+            return program == other.program && name == other.name;
+        }
+    };
+    struct UniformKeyHash {
+        size_t operator()(const UniformKey &key) const {
+            return std::hash<const void *>()(key.name) ^ (static_cast<size_t>(key.program) * 0x9E3779B97F4A7C15ull);
+        }
+    };
+    std::unordered_map<UniformKey, GLint, UniformKeyHash> uniformCache_;
 
     EGLDisplay display_ = EGL_NO_DISPLAY;
     EGLSurface surface_ = EGL_NO_SURFACE;
@@ -593,7 +645,19 @@ private:
     bool scrolling_ = false;   // 指针事件之间的瞬时速度（由 OnTouch 写、UpdateAnim 读）
     std::mutex animMutex_;
     int64_t lastAnimMs_ = 0;
+    int64_t lastAnimNs_ = 0;   // 弹簧步长基准（纳秒，见 RenderLoop）
     void UpdateAnim(float dtSeconds);
+    /** 判停时页签弹簧的状态（见 SettleTabSprings）。 */
+    enum class SpringSettle {
+        kFar,       // 还有弹簧离目标较远（欠阻尼弹簧折返点的误判）：当它还在动
+        kSnapped,   // 都贴着目标，已对齐、速度清零，有值被改动：要再画一帧
+        kExact,     // 本来就在目标上
+    };
+    /**
+     * 速率判据判停时调用：每根页签弹簧都贴着目标（kSettle*Tolerance）才对齐目标值、速度清零。
+     * 不对齐的话静止画面停在哪一帧取决于帧时序（判停时离目标还差一点）。
+     */
+    SpringSettle SettleTabSprings();
 
     /**
      * 页签格的内缩（px）。**所有"页签格几何"都必须走这里**：触摸映射（TabValueFromX）、
