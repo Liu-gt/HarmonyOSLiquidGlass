@@ -1098,10 +1098,12 @@ constexpr int64_t kInteractiveWindowMs = 400;
 constexpr float kIdleMotionRate = 0.06f;
 // 弹簧单步的最长步长（UpdateAnim 的夹取），换算速率用同一个值
 constexpr float kMaxSpringStepSec = 0.05f;
-// 落定对齐的位置容差（见 SettleTabSprings）：几何量（页签位置 / 缩放 / 速度形变）与强度量
+// 落定对齐的位置容差（见 SettleSprings）：几何量（页签位置 / 缩放 / 速度形变）与强度量
 // （按压进度 / 光斑 / 按钮按压）。
 constexpr float kSettleGeometryTolerance = 0.002f;
 constexpr float kSettleLevelTolerance = 0.01f;
+// 大面积形状的缩放（弹窗卡片 ~1140px 宽）：0.0005 ≈ 0.6px
+constexpr float kSettleScaleTolerance = 0.0005f;
 
 // vsync 对齐出帧（见 GlesRenderer::WaitForRenderSlot）：出帧点 = vsync + 0.4 周期（夹在 1.5~4ms），
 // 离下个 vsync 不足 2.5ms 就顺延：一帧录制 + 交换约 1.5~2.5ms（SURFACE 的取 / 交 buffer 走 IPC），
@@ -1685,7 +1687,7 @@ void GlesRenderer::UpdateAnim(float dt) {
     }
 }
 
-GlesRenderer::SpringSettle GlesRenderer::SettleTabSprings() {
+GlesRenderer::SpringSettle GlesRenderer::SettleSprings() {
     std::lock_guard<std::mutex> lock(animMutex_);
     const bool dragging = anim_.dragging;
     const float valueTarget = dragging ? anim_.targetValue : static_cast<float>(anim_.targetIndex);
@@ -1708,6 +1710,12 @@ GlesRenderer::SpringSettle GlesRenderer::SettleTabSprings() {
         allNear = allNear &&
                   near(btnPress_[i], (btnDownIndex_ == i) ? 1.0f : 0.0f, kSettleLevelTolerance);
     }
+    // 弹窗：按钮按压（入场缩放见下）
+    for (int i = 0; i < 2; i++) {
+        allNear = allNear &&
+                  near(dialogPress_[i], (dialogDown_ == i) ? 1.0f : 0.0f, kSettleLevelTolerance);
+    }
+    allNear = allNear && near(dialogScale_, 1.0f, kSettleScaleTolerance);
     if (!allNear) {
         return SpringSettle::kFar;
     }
@@ -1730,6 +1738,10 @@ GlesRenderer::SpringSettle GlesRenderer::SettleTabSprings() {
     for (int i = 0; i < kIconButtonCount; i++) {
         snap(btnPress_[i], btnPressVelocity_[i], (btnDownIndex_ == i) ? 1.0f : 0.0f);
     }
+    for (int i = 0; i < 2; i++) {
+        snap(dialogPress_[i], dialogPressVel_[i], (dialogDown_ == i) ? 1.0f : 0.0f);
+    }
+    snap(dialogScale_, dialogScaleVel_, 1.0f);
     return changed ? SpringSettle::kSnapped : SpringSettle::kExact;
 }
 
@@ -5226,6 +5238,9 @@ void GlesRenderer::RenderLoop(void *window) {
             UpdateContentTexture(targetW_, targetH_);
             skippedFrames_++;
             std::this_thread::sleep_for(std::chrono::milliseconds(kNormalFrameMs));
+            // 睡掉的时间不是动画时间：醒来从当前画面起步。否则第一步 dt = 睡眠时长（夹到 50ms），
+            // 按下即跟手的页签弹簧会一步跨过全程（指示器瞬移），按钮按压 / 松手第一帧跳一大截。
+            lastAnimNs_ = MonoNs();
             LogFps();
             continue;
         }
@@ -5295,21 +5310,21 @@ void GlesRenderer::RenderLoop(void *window) {
         // 判定依据（任一成立就要画）：
         //   ① 输入/参数/场景/尺寸变化（forceRedraw_）；上一轮等节拍时带过来的"要画"（carryActive_）
         //   ② 纹理重传（uploads）
-        //   ③ 弹簧还在动（位移速率超过阈值），或刚落定、对齐后要再画一帧（SettleTabSprings）
+        //   ③ 弹簧还在动（位移速率超过阈值），或刚落定、对齐后要再画一帧（SettleSprings）
         //   ④ 交互窗口内（触摸后 400ms，保证跟手流畅）
         //   ⑤ ArkTS 内容纹理有新帧
         // 不画时 surface 保留最后一帧，屏幕内容不变；渲染线程只睡 16ms 醒来再查。
         const bool interacting = (animNow - lastTouchMs_.load()) < kInteractiveWindowMs;
         const bool carried = carryActive_;
         carryActive_ = false;
-        // 弹簧：按位移速率判（见 kIdleMotionRate）。判停的那一轮先过 SettleTabSprings：都贴着目标
+        // 弹簧：按位移速率判（见 kIdleMotionRate）。判停的那一轮先过 SettleSprings：都贴着目标
         // 就对齐、再画最后一帧（静止画面与帧时序无关）；还差得远（折返点误判）就当它还在动。
         const float springStepSec = std::min(dt, kMaxSpringStepSec);
         bool springing = springStepSec > 0.0f ? gSpringMotion > kIdleMotionRate * springStepSec
                                               : wasSpringing_;
         bool snapped = false;
         if (!springing && wasSpringing_) {
-            const SpringSettle settle = SettleTabSprings();
+            const SpringSettle settle = SettleSprings();
             // 位移恰为 0（刚度 0 之类卡住的弹簧）不算在动，免得一直出帧
             springing = settle == SpringSettle::kFar && gSpringMotion > 0.0f;
             snapped = settle == SpringSettle::kSnapped;
@@ -5320,6 +5335,9 @@ void GlesRenderer::RenderLoop(void *window) {
         if (!active) {
             skippedFrames_++;
             std::this_thread::sleep_for(std::chrono::milliseconds(kNormalFrameMs));
+            // 睡掉的时间不是动画时间：醒来从当前画面起步。否则第一步 dt = 睡眠时长（夹到 50ms），
+            // 按下即跟手的页签弹簧会一步跨过全程（指示器瞬移），按钮按压 / 松手第一帧跳一大截。
+            lastAnimNs_ = MonoNs();
             LogFps();
             continue;
         }

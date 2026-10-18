@@ -462,7 +462,7 @@ private:
     std::condition_variable vsyncWaitCv_;
     /** 节拍等待后回到循环顶部时，把"这一轮要画"带到下一轮（forceRedraw_ 已被消费）。 */
     bool carryActive_ = false;
-    /** 上一轮弹簧是否还在动（判停的那一轮做一次落定对齐，见 SettleTabSprings）。 */
+    /** 上一轮弹簧是否还在动（判停的那一轮做一次落定对齐，见 SettleSprings）。 */
     bool wasSpringing_ = false;
 
     /**
@@ -647,17 +647,17 @@ private:
     int64_t lastAnimMs_ = 0;
     int64_t lastAnimNs_ = 0;   // 弹簧步长基准（纳秒，见 RenderLoop）
     void UpdateAnim(float dtSeconds);
-    /** 判停时页签弹簧的状态（见 SettleTabSprings）。 */
+    /** 判停时弹簧（页签 + 弹窗）的状态（见 SettleSprings）。 */
     enum class SpringSettle {
         kFar,       // 还有弹簧离目标较远（欠阻尼弹簧折返点的误判）：当它还在动
         kSnapped,   // 都贴着目标，已对齐、速度清零，有值被改动：要再画一帧
         kExact,     // 本来就在目标上
     };
     /**
-     * 速率判据判停时调用：每根页签弹簧都贴着目标（kSettle*Tolerance）才对齐目标值、速度清零。
+     * 速率判据判停时调用：页签与弹窗的每根弹簧都贴着目标（kSettle*Tolerance）才对齐目标值、速度清零。
      * 不对齐的话静止画面停在哪一帧取决于帧时序（判停时离目标还差一点）。
      */
-    SpringSettle SettleTabSprings();
+    SpringSettle SettleSprings();
 
     /**
      * 页签格的内缩（px）。**所有"页签格几何"都必须走这里**：触摸映射（TabValueFromX）、
